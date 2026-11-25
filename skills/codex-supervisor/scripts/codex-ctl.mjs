@@ -24,10 +24,10 @@ const ALLOWED_FLAGS = {
   health: new Set([]),
   models: new Set(["limit"]),
   threads: new Set(["limit", "cwd"]),
-  start: new Set(["cwd", "model", "sandbox", "approval", "effort", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
-  resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "prompt", "prompt-file", "stdin"]),
-  fork: new Set(["cwd", "model", "sandbox", "approval", "effort", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
-  send: new Set(["cwd", "model", "approval", "effort", "prompt", "prompt-file", "stdin"]),
+  start: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
+  resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "prompt", "prompt-file", "stdin"]),
+  fork: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
+  send: new Set(["cwd", "model", "approval", "effort", "mode", "prompt", "prompt-file", "stdin"]),
   steer: new Set(["turn-id", "fallback-send", "prompt", "prompt-file", "stdin"]),
   interrupt: new Set(["turn-id"]),
   respond: new Set(["decision", "scope", "reason", "permissions", "answer", "answers"]),
@@ -260,11 +260,11 @@ Commands:
   models [--limit N]                      List available Codex models
   threads [--limit N] [--cwd DIR]         List recent Codex threads
   start [--cwd DIR] [--model M] [--sandbox danger-full-access|workspace-write|read-only]
-        [--approval never|on-request] [--effort low|medium|high|xhigh]
-        [--name TITLE] [--ephemeral] [--prompt TEXT | --prompt-file FILE | --stdin]
-  resume <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--prompt ...]
-  fork <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--name TITLE] [--ephemeral] [--prompt ...]
-  send <threadId> [--model M] [--effort ...] (--prompt TEXT | --prompt-file FILE | --stdin)
+        [--approval never|on-request|untrusted] [--effort low|medium|high|xhigh]
+        [--mode plan|default] [--name TITLE] [--ephemeral] [--prompt TEXT | --prompt-file FILE | --stdin]
+  resume <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--mode plan|default] [--prompt ...]
+  fork <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--mode plan|default] [--name TITLE] [--ephemeral] [--prompt ...]
+  send <threadId> [--model M] [--effort ...] [--mode plan|default] (--prompt TEXT | --prompt-file FILE | --stdin)
   steer <threadId> [--turn-id ID] [--fallback-send] (--prompt TEXT | --prompt-file FILE | --stdin)
   interrupt <threadId> [--turn-id ID]     Request interruption of active turn
   respond <reqId> --decision accept|acceptForSession|decline|cancel [--scope turn|session]
@@ -292,6 +292,9 @@ async function main() {
   let limit;
   let timeoutSec;
 
+  if (flags.mode !== undefined && flags.mode !== "plan" && flags.mode !== "default") {
+    throw new Error(`Invalid --mode "${flags.mode}" (expected "plan" or "default")`);
+  }
   if (cmd === "models" || cmd === "threads" || cmd === "history") {
     limit = parseIntFlag("limit", flags.limit, 1, 200);
   }
@@ -368,6 +371,7 @@ async function main() {
       sandbox: flags.sandbox || "workspace-write",
       approvalPolicy: flags.approval || "on-request",
       effort: flags.effort,
+      mode: flags.mode,
       name: flags.name,
       ephemeral: Boolean(flags.ephemeral),
       prompt,
@@ -384,6 +388,7 @@ async function main() {
       sandbox: flags.sandbox,
       approvalPolicy: flags.approval,
       effort: flags.effort,
+      mode: flags.mode,
       prompt,
     });
     console.log(JSON.stringify(r, null, 2));
@@ -398,6 +403,7 @@ async function main() {
       sandbox: flags.sandbox,
       approvalPolicy: flags.approval,
       effort: flags.effort,
+      mode: flags.mode,
       name: flags.name,
       ephemeral: flags.ephemeral !== undefined ? Boolean(flags.ephemeral) : undefined,
       prompt,
@@ -411,6 +417,7 @@ async function main() {
       threadId: positional[1],
       model: flags.model,
       effort: flags.effort,
+      mode: flags.mode,
       cwd: flags.cwd,
       approvalPolicy: flags.approval,
       prompt,

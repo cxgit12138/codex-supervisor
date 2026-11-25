@@ -804,6 +804,14 @@ function handleServerNotification(msg) {
         files: paths,
       });
     } else if (item.type === "commandExecution") {
+      const actions = Array.isArray(item.commandActions)
+        ? item.commandActions.slice(0, 12).map((a) => ({
+            type: a?.type || "unknown",
+            path: a?.path || null,
+            name: a?.name || null,
+            query: a?.query || null,
+          }))
+        : [];
       const rec = {
         command: truncateText(String(item.command || ""), 200),
         exitCode: item.exitCode ?? null,
@@ -817,6 +825,7 @@ function handleServerNotification(msg) {
         kind: "commandExecution",
         turnId,
         ...rec,
+        actions,
         outputTail: typeof item.aggregatedOutput === "string" ? item.aggregatedOutput.slice(-2000) : "",
       });
       pushEvent(threadId, "info", "command_completed", turnId, rec);
@@ -844,6 +853,39 @@ function handleServerNotification(msg) {
         durationMs: item.durationMs ?? null,
         summary: truncateText(String(summary), 400),
         outputTail: outText,
+      });
+    } else if (item.type === "plan") {
+      const planText = String(item.text || "").trim();
+      if (planText) {
+        if (st.lastMessageTurnId !== turnId || st.lastPhase !== "final_answer") {
+          st.lastMessage = planText;
+          st.lastMessageTurnId = turnId || null;
+          st.lastPhase = "plan";
+        }
+        appendThreadLog(st, { kind: "plan_item", turnId, text: planText });
+      }
+    } else if (item.type === "subAgentActivity") {
+      const kindStr = typeof item.kind === "string" ? item.kind : item.kind?.type || null;
+      const summary = [item.model, item.reasoningEffort ? `effort:${item.reasoningEffort}` : ""].filter(Boolean).join(" · ");
+      appendThreadLog(st, {
+        kind: "toolExecution",
+        turnId,
+        toolType: "subAgentActivity",
+        server: null,
+        name: String(item.agentPath || item.agentThreadId || "sub-agent"),
+        status: kindStr,
+        durationMs: null,
+        summary,
+        outputTail: "",
+      });
+    } else if (item.type === "contextCompaction") {
+      appendThreadLog(st, { kind: "context_compaction", turnId });
+    } else if (item.type === "enteredReviewMode" || item.type === "exitedReviewMode") {
+      appendThreadLog(st, {
+        kind: "review_mode",
+        turnId,
+        phase: item.type === "enteredReviewMode" ? "entered" : "exited",
+        review: truncateText(String(item.review || ""), 300),
       });
     }
     return;
@@ -1383,6 +1425,35 @@ function buildServerRequestResponse(entry, body) {
   throw err;
 }
 
+function validateMode(mode) {
+  if (mode === undefined || mode === null || mode === "") return null;
+  if (mode !== "plan" && mode !== "default") {
+    const err = new Error(`Invalid mode "${mode}" (expected "plan" or "default")`);
+    err.statusCode = 400;
+    throw err;
+  }
+  return mode;
+}
+
+function applyCollaborationMode(turnParams, body, st) {
+  const mode = validateMode(body.mode);
+  if (!mode) return null;
+  const effModel = body.model || st.model;
+  if (!effModel) {
+    const err = new Error("--mode requires a known model (pass --model or start/resume the thread first)");
+    err.statusCode = 400;
+    throw err;
+  }
+  turnParams.collaborationMode = {
+    mode,
+    settings: {
+      model: effModel,
+      ...(body.effort ? { reasoning_effort: body.effort } : {}),
+    },
+  };
+  return mode;
+}
+
 async function handleApi(req, res) {
   lastActivityMs = Date.now();
   const url = new URL(req.url, "http://127.0.0.1");
@@ -1435,6 +1506,7 @@ async function handleApi(req, res) {
 
     if (url.pathname === "/start" && req.method === "POST") {
       const body = await readJsonBody(req);
+      const reqMode = validateMode(body.mode);
       const startParams = {
         dynamicTools: [SUPERVISOR_DYNAMIC_TOOL],
         developerInstructions: body.developerInstructions
@@ -1486,6 +1558,7 @@ async function handleApi(req, res) {
           if (body.effort) turnParams.effort = body.effort;
           if (body.cwd) turnParams.cwd = body.cwd;
           if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
+          applyCollaborationMode(turnParams, body, st);
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
           markTurnStartedIfNotFinished(st, turnId);
@@ -1495,6 +1568,7 @@ async function handleApi(req, res) {
             turnId,
             model: body.model || st.model,
             effort: body.effort || null,
+            mode: reqMode,
             prompt: body.prompt,
           });
         }
@@ -1514,6 +1588,7 @@ async function handleApi(req, res) {
     if (url.pathname === "/resume" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      const reqMode = validateMode(body.mode);
 
       const out = await withThreadLock(body.threadId, async () => {
         const params = { threadId: body.threadId, excludeTurns: true };
@@ -1568,6 +1643,7 @@ async function handleApi(req, res) {
           const turnParams = { threadId: body.threadId, input: makeTextInput(body.prompt) };
           if (body.model) turnParams.model = body.model;
           if (body.effort) turnParams.effort = body.effort;
+          applyCollaborationMode(turnParams, body, st);
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
           markTurnStartedIfNotFinished(st, turnId);
@@ -1577,6 +1653,7 @@ async function handleApi(req, res) {
             turnId,
             model: body.model || st.model,
             effort: body.effort || null,
+            mode: reqMode,
             prompt: body.prompt,
           });
         }
@@ -1597,6 +1674,7 @@ async function handleApi(req, res) {
     if (url.pathname === "/fork" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      const reqMode = validateMode(body.mode);
 
       const params = { threadId: body.threadId, excludeTurns: true };
       if (body.cwd) params.cwd = body.cwd;
@@ -1660,6 +1738,7 @@ async function handleApi(req, res) {
           if (body.model) turnParams.model = body.model;
           if (body.effort) turnParams.effort = body.effort;
           try {
+            applyCollaborationMode(turnParams, body, st);
             const tRes = await rpcCall("turn/start", turnParams);
             turnId = tRes.turn?.id || tRes.turnId || null;
             markTurnStartedIfNotFinished(st, turnId);
@@ -1669,6 +1748,7 @@ async function handleApi(req, res) {
               turnId,
               model: body.model || st.model,
               effort: body.effort || null,
+              mode: reqMode,
               prompt: body.prompt,
             });
           } catch (e) {
@@ -1696,6 +1776,7 @@ async function handleApi(req, res) {
       if (!body.threadId || !body.prompt) {
         return jsonResponse(res, 400, { error: "threadId and prompt required" });
       }
+      const reqMode = validateMode(body.mode);
       const out = await withThreadLock(body.threadId, async () => {
         const st = getThreadState(body.threadId);
         const cursorBefore = st.nextSeq - 1;
@@ -1707,6 +1788,7 @@ async function handleApi(req, res) {
         if (body.effort) turnParams.effort = body.effort;
         if (body.cwd) turnParams.cwd = body.cwd;
         if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
+        applyCollaborationMode(turnParams, body, st);
 
         const tRes = await rpcCall("turn/start", turnParams);
         const turnId = tRes.turn?.id || tRes.turnId || null;
@@ -1717,6 +1799,7 @@ async function handleApi(req, res) {
           turnId,
           model: body.model || st.model,
           effort: body.effort || null,
+          mode: reqMode,
           prompt: body.prompt,
         });
         return {
