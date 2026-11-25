@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#1e293b"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="leftBubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="rightBubble" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#60a5fa"/>
+      <stop offset="100%" stop-color="#2563eb"/>
+    </linearGradient>
+  </defs>
+  <rect x="10" y="10" width="108" height="108" rx="26" fill="url(#bg)"/>
+  <!-- Left bubble (Codex) -->
+  <rect x="24" y="34" width="54" height="32" rx="12" fill="url(#leftBubble)"/>
+  <circle cx="40" cy="50" r="3.5" fill="#ecfdf5"/>
+  <circle cx="51" cy="50" r="3.5" fill="#ecfdf5"/>
+  <circle cx="62" cy="50" r="3.5" fill="#ecfdf5"/>
+  <!-- Right bubble (Supervisor) -->
+  <rect x="50" y="64" width="54" height="32" rx="12" fill="url(#rightBubble)"/>
+  <path d="M64 80h26M78 72l12 8-12 8" fill="none" stroke="#eff6ff" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

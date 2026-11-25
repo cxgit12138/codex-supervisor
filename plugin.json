@@ -1,0 +1,26 @@
+{
+  "$schema": "https://antigravity.google/schemas/v1/plugin.json",
+  "name": "codex-supervisor",
+  "displayName": "Codex Supervisor",
+  "version": "1.3.1",
+  "description": "Dispatch and supervise local OpenAI Codex sessions via codex app-server with mid-turn steering, native message_supervisor bidirectional comms, live side-pane chat viewer, thread forking, and zero-polling wakeups.",
+  "author": "cxgit12138",
+  "homepage": "https://github.com/cxgit12138/codex-supervisor",
+  "repository": "https://github.com/cxgit12138/codex-supervisor",
+  "license": "MIT",
+  "keywords": [
+    "codex",
+    "openai",
+    "supervisor",
+    "subagent",
+    "sidecar",
+    "app-server",
+    "steering"
+  ],
+  "logo": "assets/logo.svg",
+  "suggestedPrompts": [
+    "派 Codex 在当前仓库里做这个任务，你来全程监工验收",
+    "列出我本地 Codex 可用的模型和最近的会话",
+    "给正在干活的 Codex 发一条插队纠偏指令"
+  ]
+}

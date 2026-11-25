@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Codex Supervisor</title>
+  <script src="/preload.js"></script>
+  <link rel="stylesheet" href="./styles.css?v=1.3.0">
+</head>
+<body>
+  <div class="shell">
+    <!-- Top bar: session switcher & controls -->
+    <header class="topbar">
+      <div class="session-row">
+        <span id="status-dot" class="dot dot-idle" title="会话状态"></span>
+        <select id="session-select" class="session-select" aria-label="切换 Codex 会话">
+          <option value="">正在加载会话…</option>
+        </select>
+        <button type="button" id="refresh-btn" class="icon-btn" title="立即刷新">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7"/>
+            <path d="M13.5 3v2.8h-2.8"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="meta-bar">
+        <div id="meta-chips" class="meta-chips"></div>
+        <div id="detail-mode" class="segmented" role="group" aria-label="内容详略档位">
+          <button type="button" class="seg-btn" data-mode="minimal" title="仅显示核心双边对话">简洁</button>
+          <button type="button" class="seg-btn on" data-mode="default" title="核心对话 + 过程说明与计划（不含工具调用）">默认</button>
+          <button type="button" class="seg-btn" data-mode="detailed" title="全部展开（含命令、文件改动及其他工具调用）">详细</button>
+        </div>
+      </div>
+    </header>
+
+    <!-- Chat stream: Left = Codex, Right = Antigravity Supervisor -->
+    <main id="chat-scroll" class="chat-scroll" aria-live="polite">
+      <div id="empty-state" class="empty-state hidden">
+        <div class="empty-title">暂无监管会话记录</div>
+        <div class="empty-desc">在对话里让我派 Codex 干活后，双方的派单、插队、阶段汇报和验收回复会实时显示在这里。</div>
+      </div>
+
+      <div id="chat-list" class="chat-list"></div>
+
+      <div id="live-indicator" class="live-indicator hidden">
+        <div class="bubble bubble-codex bubble-live">
+          <div class="bubble-head">
+            <span class="role-name">Codex</span>
+            <span class="badge tone-teal">执行中</span>
+            <span id="live-model-sub" class="meta-sub hidden"></span>
+            <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          </div>
+          <div id="live-draft" class="bubble-body"></div>
+        </div>
+      </div>
+    </main>
+
+    <button type="button" id="scroll-bottom-btn" class="scroll-btn hidden" title="回到最新消息">↓ 最新消息</button>
+  </div>
+
+  <script src="./app.js?v=1.3.1"></script>
+</body>
+</html>
