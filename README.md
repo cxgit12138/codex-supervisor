@@ -18,7 +18,7 @@
 
 - **原生侧边栏实时对话面板（Sidecar UI）**
   - 左 Codex / 右 Antigravity 双边气泡流，实时同步派单、插队、主动汇报、审批问答、执行出错与最终回复；
-  - 支持 **三档详略切换**（`简洁` 仅核心对话 / `默认` 含过程说明与计划 / `详细` 展开全部命令、文件改动、查看图片、网页搜索、MCP 工具、协作子代理等工具调用与可折叠输出）；
+  - 支持 **三档详略切换**（`简洁` 仅核心对话 / `默认` 含过程说明、计划与系统状态 / `详细` 展开全部读取文件、搜索代码、列出目录、执行命令、修改文件、查看图片、网页搜索、MCP 工具、协作子代理等工具调用与可折叠输出）；
   - 顶部显示工作区目录、模型名与沙箱标签，每条 Codex 气泡自动标注当前回合的模型名与思考深度（`model · effort`）；
   - 自动跟随 Antigravity 宿主亮/暗色主题，采用 ETag 增量轮询与磁盘缓存，查看面板 **零 LLM Token 消耗**。
 - **零轮询事件唤醒（Reactive Wait）**
@@ -120,7 +120,7 @@ codex-supervisor/
 | 命令 | 说明 |
 | :--- | :--- |
 | `models` / `threads` | 列出本地 Codex 可用模型、历史会话与默认配置 |
-| `start` / `send` | 新建会话并派发任务，或在原线程继续追问/返工（支持 `--model` / `--effort` / `--sandbox` / `--approval`） |
+| `start` / `send` | 新建会话并派发任务，或在原线程继续追问/返工（支持 `--model` / `--effort` / `--mode plan\|default` / `--sandbox` / `--approval`） |
 | `resume` / `fork` | 接管或无冲突分叉本地已有 Codex 会话 |
 | `steer` / `interrupt` | 向运行中的回合中途插队纠偏，或请求立即中断 |
 | `wait` / `respond` | 零轮询阻塞等待关键事件；显式回复审批、提问或 `message_supervisor` 请示 |
@@ -145,8 +145,8 @@ codex-supervisor/
    - `codex app-server` 协议仅支持在新建线程（`start`）时注册动态工具，因此只有通过本插件**新建的会话**才会自动拥有原生 `message_supervisor`（主动阶段汇报 / 阻塞请示）工具；
    - 通过 `resume` / `fork` 接管的桌面端旧会话仍完整支持派单追问、中途 `steer` 插队、`interrupt` 喊停、审批与提问接管以及侧边栏实时展示。
 
-4. **安装或更新插件后侧边栏空白 / 没看到最新界面**
-   - Sidecar 后端进程在插件启停时加载，Webview 也可能缓存旧前端资源；首次安装或更新后，若面板未生效，请在 Antigravity 插件管理页**关闭再重新开启 Codex Supervisor**，或**重启一次 Antigravity 客户端**。
+4. **安装或更新插件后侧边栏空白 / 入口未出现 / 没看到最新界面**
+   - Sidecar 后端进程与前端缓存通常在客户端启动时初始化（部分 Antigravity 版本在插件页直接开关热重载时可能不会重新拉起 Sidecar 进程）；首次安装或更新插件后，建议**直接重启一次 Antigravity 客户端**。
 
 5. **常驻桥接进程与写锁释放**
    - 桥接进程 `bridge-daemon.mjs` 会在空闲 **60 分钟后自动退出**；如果结束后想立刻切回 Codex Desktop App 编辑同一会话，可让 Antigravity 执行 `stop`（或运行 `codex-ctl.mjs stop`）立即释放线程写锁。
@@ -203,7 +203,7 @@ Then open the live chat panel via the sidecar **`+`** button → **Codex Supervi
 - **Codex Desktop writer locks (`already has an active writer`)**: On Windows, once Codex Desktop App opens a thread during a run, it holds the file writer lock until the Desktop App exits. Use **`fork`** to branch the thread cleanly without closing Desktop App, or exit Desktop App before calling `resume`. New sessions do not require Codex Desktop App to be running.
 - **Why older Desktop threads aren't in the side-pane dropdown**: The panel only lists sessions supervised via this plugin (`~/.gemini/cache/codex-supervisor/logs/`). `resume` or `fork` any Desktop thread once to bring it into the panel.
 - **`message_supervisor` availability**: Dynamic tools are registered on `thread/start`, so native `message_supervisor` pings/questions apply to newly started threads (resumed/forked threads still support full `send`, `steer`, `interrupt`, approvals, and live side-pane viewing).
-- **Panel didn't refresh after install/update**: Toggle **Codex Supervisor** off and on in Antigravity's Plugins page (or restart Antigravity) to reload the sidecar backend and webview cache.
+- **Panel missing or didn't refresh after install/update**: Restart the **Antigravity** client once so the sidecar backend process and webview cache reload cleanly (toggling the plugin in-place may not re-spawn sidecar processes on some Antigravity builds).
 - **Releasing locks after supervision**: The bridge daemon auto-exits after 60 minutes of idle time, or run `codex-ctl.mjs stop` to release thread locks immediately.
 
 ---

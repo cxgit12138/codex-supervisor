@@ -1,10 +1,10 @@
 ---
 name: codex-supervisor
 description: >-
-  Use when the user asks to delegate work to OpenAI Codex, supervise/monitor
-  Codex while it works, send mid-turn steering instructions to a running Codex
-  session, resume or fork a Codex Desktop thread, or list local Codex
-  models/sessions.
+  Use when the user asks to delegate work or plan tasks with OpenAI Codex,
+  supervise/monitor Codex while it works, send mid-turn steering instructions to
+  a running Codex session, resume or fork a Codex Desktop thread, or list local
+  Codex models/sessions.
 ---
 
 # Codex Supervisor
@@ -70,10 +70,24 @@ specifies otherwise):
    - `node $CTL models`
    - `node $CTL threads --limit 10`
 2. **Start (or resume / fork) a Codex session**:
+   - **Always verify the target workspace (`--cwd <dir>`) before starting a new session**:
+     - Explicitly pass `--cwd <target_dir>` on `start` whenever the user names a
+       specific repository/folder or multiple workspaces are active (never
+       silently assume the shell's default directory is the intended repo, and
+       ensure the directory exists first).
+     - `--cwd` sets Codex's working root, `workspace-write` sandbox boundary,
+       and the workspace badge shown in the side-pane panel. If the user
+       switches to a different repository mid-conversation, start a new Codex
+       thread with the new `--cwd` instead of reusing an unrelated thread.
    - Optional flags on `start`, `resume`, `fork`, and `send`:
-     - `--cwd <dir>` (workspace directory; defaults to current workspace on `start`)
+     - `--cwd <dir>` (target workspace directory; defaults to the shell's
+       current directory on `start` if omitted)
      - `--model <id>` and `--effort <low|medium|high|xhigh>` (omit to use
        Codex's configured defaults; can also switch model/effort on any `send`)
+     - `--mode <plan|default>` (optional; omit for normal execution. Pass
+       `--mode plan` to enter Codex Plan collaboration mode with built-in
+       `request_user_input` and structured `plan` output; pass `--mode default`
+       on the next `send` to return to normal execution)
    - Prefer passing multi-line or Chinese prompts via `--prompt-file` (safest
      across both PowerShell 7 and Windows PowerShell 5.1) or `--stdin` (in
      PowerShell 7 / `pwsh` UTF-8). For a literal `--prompt` value starting with
