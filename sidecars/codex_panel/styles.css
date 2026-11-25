@@ -325,6 +325,8 @@ html, body {
 }
 .bubble-body p { margin: 0 0 6px; }
 .bubble-body p:last-child { margin-bottom: 0; }
+.bubble-body p.md-heading { font-weight: 600; color: var(--cs-fg); margin: 6px 0 4px; }
+.bubble-body p.md-heading:first-child { margin-top: 0; }
 .bubble-body ul { margin: 4px 0 6px; padding-left: 18px; }
 .bubble-body li { margin: 2px 0; }
 .bubble-body code {

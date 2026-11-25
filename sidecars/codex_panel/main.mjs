@@ -351,10 +351,11 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         lastModelSub = subStr;
         if (rec.turnId) turnModelSub.set(rec.turnId, subStr);
       }
+      const baseBadge = actionMap[rec.action] || "发送指令";
       messages.push({
         id: ++seq,
         side: "supervisor",
-        badge: actionMap[rec.action] || "发送指令",
+        badge: rec.mode === "plan" ? `${baseBadge} · Plan` : baseBadge,
         tone: "blue",
         ts,
         text: String(rec.prompt || ""),
@@ -518,16 +519,49 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     if (kind === "commandExecution") {
       const exitStr = rec.exitCode !== null && rec.exitCode !== undefined ? `exit ${rec.exitCode}` : rec.status || "";
       const durStr = rec.durationMs ? `${rec.durationMs}ms` : "";
+      const actions = Array.isArray(rec.actions) ? rec.actions : [];
+      const cmdShort = shortCmd(rec.command);
+      const rawOut = rec.outputTail ? String(rec.outputTail).trim() : "";
+
+      let badge = "执行命令";
+      let bodyText = `\`\`\`\n${cmdShort}\n\`\`\``;
+      let detailText = rawOut || null;
+
+      if (actions.length > 0 && actions.every((a) => a.type === "read")) {
+        badge = "读取文件";
+        const files = [...new Set(actions.map((a) => a.name || a.path).filter(Boolean))];
+        bodyText = files.length === 1
+          ? `\`${files[0]}\``
+          : files.length > 1
+            ? files.map((f) => `- \`${f}\``).join("\n")
+            : bodyText;
+        detailText = [cmdShort ? `$ ${cmdShort}` : "", rawOut].filter(Boolean).join("\n\n") || null;
+      } else if (actions.length > 0 && actions.every((a) => a.type === "listFiles")) {
+        badge = "列出目录";
+        const dirs = [...new Set(actions.map((a) => a.path).filter(Boolean))];
+        bodyText = dirs.length ? dirs.map((d) => `\`${d}\``).join("、") : "当前工作区目录";
+        detailText = [cmdShort ? `$ ${cmdShort}` : "", rawOut].filter(Boolean).join("\n\n") || null;
+      } else if (actions.length > 0 && actions.every((a) => a.type === "search")) {
+        badge = "搜索代码";
+        const linesSearch = actions.map((a) => {
+          const q = a.query ? `\`${a.query}\`` : "";
+          const p = a.path ? `（\`${a.path}\`）` : "";
+          return q || p ? `- ${q}${p}` : "";
+        }).filter(Boolean);
+        bodyText = linesSearch.length ? linesSearch.join("\n") : bodyText;
+        detailText = [cmdShort ? `$ ${cmdShort}` : "", rawOut].filter(Boolean).join("\n\n") || null;
+      }
+
       messages.push({
         id: ++seq,
         side: "codex",
         tier: "tool",
-        badge: "执行命令",
+        badge,
         tone: rec.exitCode && rec.exitCode !== 0 ? "red" : "muted",
         sub: joinSub(resolveModelSub(rec.turnId), exitStr, durStr),
         ts,
-        text: `\`\`\`\n${shortCmd(rec.command)}\n\`\`\``,
-        detail: rec.outputTail ? String(rec.outputTail).trim() : null,
+        text: bodyText,
+        detail: detailText,
       });
       continue;
     }
@@ -538,6 +572,7 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         webSearch: "网页搜索",
         imageView: "查看图片",
         collabAgentToolCall: "协作子代理",
+        subAgentActivity: "子代理动态",
         imageGeneration: "生成图片",
         dynamicToolCall: "动态工具",
       };
@@ -554,6 +589,48 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         ts,
         text: bodyText,
         detail: rec.outputTail ? String(rec.outputTail).trim() : null,
+      });
+      continue;
+    }
+
+    if (kind === "plan_item") {
+      const txt = String(rec.text || "").trim();
+      if (txt) {
+        if (rec.turnId) lastFinalTextByTurn.set(rec.turnId, txt);
+        messages.push({
+          id: ++seq,
+          side: "codex",
+          tier: "core",
+          badge: "方案计划",
+          tone: "indigo",
+          sub: resolveModelSub(rec.turnId),
+          ts,
+          text: txt,
+        });
+      }
+      continue;
+    }
+
+    if (kind === "context_compaction") {
+      messages.push({
+        id: ++seq,
+        side: "system",
+        tier: "narration",
+        ts,
+        text: "Codex 已自动压缩上下文",
+      });
+      continue;
+    }
+
+    if (kind === "review_mode") {
+      const label = rec.phase === "entered" ? "进入代码审查模式" : "退出代码审查模式";
+      const suffix = rec.review && rec.review.length <= 60 ? ` · ${rec.review}` : "";
+      messages.push({
+        id: ++seq,
+        side: "system",
+        tier: "narration",
+        ts,
+        text: `${label}${suffix}`,
       });
       continue;
     }

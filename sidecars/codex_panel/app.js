@@ -149,6 +149,13 @@
             closeUl();
             continue;
           }
+          const heading = trimmed.match(/^#{1,4}\s+(.+)$/);
+          if (heading) {
+            flushPara();
+            closeUl();
+            out += `<p class="md-heading">${renderInline(heading[1])}</p>`;
+            continue;
+          }
           const bullet = trimmed.match(/^[-*]\s+(.+)$/);
           if (bullet) {
             flushPara();
