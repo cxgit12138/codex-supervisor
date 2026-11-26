@@ -9,7 +9,7 @@
 
 让 **Google Antigravity** 把你本机的 **OpenAI Codex** 当作原生子代理来派活、监工、实时插队纠偏与验收——基于官方 `codex app-server` JSON-RPC 协议构建，**零外部依赖、零轮询低 Token 消耗**，并自带 Antigravity 原生右侧**实时双边聊天气泡面板**。
 
-![Codex Supervisor 侧边栏面板预览](assets/preview.jpg)
+![Codex Supervisor 实时监工与双边对话演示](assets/demo.gif)
 
 ---
 
@@ -117,7 +117,7 @@ codex-supervisor/
 │   └── codex-hook.mjs                  # 零依赖快路径 Hook（独立 hook-daemon.json 鉴权 + 固定模板提醒）
 ├── assets/
 │   ├── logo.svg                        # 插件图标
-│   └── preview.jpg                     # 侧边栏界面预览图
+│   └── demo.gif                        # 实时监工与双边对话演示动图
 ├── sidecars/codex_panel/               # 原生右侧边栏面板（Sidecar UI）
 │   ├── sidecar.json                    # Aux Pane 入口配置
 │   ├── main.mjs                        # 只读本地后端（解析日志 + 叠加实时状态 + ETag）
