@@ -1,0 +1,18 @@
+{
+  "codex-supervisor-notifications": {
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node hooks/codex-hook.mjs",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node hooks/codex-hook.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}
