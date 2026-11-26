@@ -7,6 +7,7 @@
  */
 
 import http from "node:http";
+import net from "node:net";
 import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
@@ -14,19 +15,234 @@ import crypto from "node:crypto";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
 
-const STATE_DIR = process.env.CODEX_BRIDGE_STATE_DIR || path.join(os.homedir(), ".gemini", "cache", "codex-supervisor");
+const RAW_STATE_DIR = path.resolve(process.env.CODEX_BRIDGE_STATE_DIR || path.join(os.homedir(), ".gemini", "cache", "codex-supervisor"));
+
+const ALLOWED_POSIX_SYSTEM_SYMLINKS = new Map([
+  ["/var", "/private/var"],
+  ["/tmp", "/private/tmp"],
+  ["/etc", "/private/etc"],
+]);
+
+function validateAndCanonicalizePosixStatePath(dirPath) {
+  // Walk existing segments from `/` down to dirPath:
+  // - Allow ONLY explicit OS-level system symlink mappings (e.g. macOS /var -> /private/var, /tmp -> /private/tmp).
+  // - Reject EVERY other symlink (inside home, outside home, or on STATE_DIR itself).
+  // - Treat ONLY ENOENT as non-existent; rethrow EACCES/EPERM/ENOTDIR.
+  const resolved = path.resolve(dirPath);
+  const root = path.parse(resolved).root;
+  const parts = resolved.slice(root.length).split(path.sep).filter(Boolean);
+  let physicalCur = root;
+
+  for (let i = 0; i < parts.length; i++) {
+    const nextPath = path.join(physicalCur, parts[i]);
+    let lst;
+    try {
+      lst = fs.lstatSync(nextPath);
+    } catch (err) {
+      if (err && err.code === "ENOENT") {
+        // Remaining segments do not exist yet; append verbatim onto canonical physicalCur
+        physicalCur = path.join(physicalCur, ...parts.slice(i));
+        break;
+      }
+      throw err;
+    }
+
+    if (lst.isSymbolicLink()) {
+      const targetReal = fs.realpathSync(nextPath);
+      const isLast = i === parts.length - 1;
+      const expectedSystemTarget = ALLOWED_POSIX_SYSTEM_SYMLINKS.get(nextPath);
+      if (isLast || !expectedSystemTarget || targetReal !== expectedSystemTarget) {
+        throw new Error(`Refusing to operate across symlink path: ${nextPath}`);
+      }
+      physicalCur = targetReal;
+    } else {
+      physicalCur = nextPath;
+    }
+  }
+
+  // Walk full descendant tree under canonical physicalCur if it already exists
+  let rootSt;
+  try {
+    rootSt = fs.lstatSync(physicalCur);
+  } catch (err) {
+    if (err && err.code === "ENOENT") return physicalCur;
+    throw err;
+  }
+  if (rootSt.isSymbolicLink()) {
+    throw new Error(`Refusing to operate on symlink state path: ${physicalCur}`);
+  }
+  if (!rootSt.isDirectory()) {
+    throw new Error(`State path exists and is not a directory: ${physicalCur}`);
+  }
+  const visited = new Set();
+  const walk = (p) => {
+    const lst = fs.lstatSync(p);
+    if (lst.isSymbolicLink()) {
+      throw new Error(`Refusing to operate across symlink child: ${p}`);
+    }
+    if (!lst.isDirectory()) return;
+    const key = `${lst.dev}:${lst.ino}`;
+    if (visited.has(key)) return;
+    visited.add(key);
+    for (const entry of fs.readdirSync(p)) {
+      walk(path.join(p, entry));
+    }
+  };
+  walk(physicalCur);
+  return physicalCur;
+}
+
+// Fixed static PowerShell script: NEVER interpolates dynamic paths into source code.
+// Receives target path and mode strictly as data via CODEX_BRIDGE_ACL_TARGET / CODEX_BRIDGE_ACL_MODE.
+const WINDOWS_ACL_STATIC_SCRIPT = [
+  "$ErrorActionPreference = 'Stop'",
+  "$mode = $env:CODEX_BRIDGE_ACL_MODE",
+  "$rawTarget = $env:CODEX_BRIDGE_ACL_TARGET",
+  "if ([string]::IsNullOrWhiteSpace($rawTarget)) { throw 'Missing CODEX_BRIDGE_ACL_TARGET' }",
+  "$root = [System.IO.Path]::GetFullPath($rawTarget)",
+  "$reparse = [System.IO.FileAttributes]::ReparsePoint",
+  "$dirAttr = [System.IO.FileAttributes]::Directory",
+  "function Try-GetAttr([string]$p) {",
+  "  try { return [System.IO.File]::GetAttributes($p) }",
+  "  catch [System.IO.FileNotFoundException] { return $null }",
+  "  catch [System.IO.DirectoryNotFoundException] { return $null }",
+  "}",
+  "function Assert-AncestorsClean([string]$fullPath) {",
+  "  $driveRoot = [System.IO.Path]::GetPathRoot($fullPath)",
+  "  $rel = $fullPath.Substring($driveRoot.Length).TrimEnd('\\', '/')",
+  "  if ([string]::IsNullOrEmpty($rel)) { return }",
+  "  $cur = $driveRoot",
+  "  foreach ($seg in ($rel -split '[\\\\/]')) {",
+  "    if ([string]::IsNullOrEmpty($seg)) { continue }",
+  "    $cur = [System.IO.Path]::Combine($cur, $seg)",
+  "    $a = Try-GetAttr $cur",
+  "    if ($null -eq $a) { break }",
+  "    if (($a -band $reparse) -ne 0) { throw \"ReparsePoint ancestor rejected: $cur\" }",
+  "  }",
+  "}",
+  "function Assert-DescendantsClean([string]$p) {",
+  "  $attr = Try-GetAttr $p",
+  "  if ($null -eq $attr) { return }",
+  "  if (($attr -band $reparse) -ne 0) { throw \"ReparsePoint rejected: $p\" }",
+  "  if (($attr -band $dirAttr) -eq 0) { throw \"State path exists and is not a directory: $p\" }",
+  "  foreach ($ch in [System.IO.Directory]::GetFileSystemEntries($p)) {",
+  "    $ca = [System.IO.File]::GetAttributes($ch)",
+  "    if (($ca -band $reparse) -ne 0) { throw \"ReparsePoint rejected: $ch\" }",
+  "    if (($ca -band $dirAttr) -ne 0) { Assert-DescendantsClean $ch }",
+  "  }",
+  "}",
+  "Assert-AncestorsClean $root",
+  "Assert-DescendantsClean $root",
+  "if ($mode -eq 'check_only') { exit 0 }",
+  "$userSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value",
+  "$sysSid = 'S-1-5-18'",
+  "$userObj = New-Object System.Security.Principal.SecurityIdentifier($userSid)",
+  "$sysObj = New-Object System.Security.Principal.SecurityIdentifier($sysSid)",
+  "$inh = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit,ObjectInherit'",
+  "$prop = [System.Security.AccessControl.PropagationFlags]::None",
+  "$rights = [System.Security.AccessControl.FileSystemRights]::FullControl",
+  "$allow = [System.Security.AccessControl.AccessControlType]::Allow",
+  "$acl = New-Object System.Security.AccessControl.DirectorySecurity",
+  "$acl.SetAccessRuleProtection($true, $false)",
+  "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($userObj, $rights, $inh, $prop, $allow)))",
+  "$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule($sysObj, $rights, $inh, $prop, $allow)))",
+  "[System.IO.Directory]::SetAccessControl($root, $acl)",
+  "$verify = [System.IO.Directory]::GetAccessControl($root)",
+  "if (-not $verify.AreAccessRulesProtected) { throw 'Root DACL inheritance protection not enabled' }",
+  "$seen = @{}",
+  "foreach ($rule in $verify.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {",
+  "  $sid = $rule.IdentityReference.Value",
+  "  if ($sid -ne $userSid -and $sid -ne $sysSid) { throw \"Unauthorized ACL SID on state dir: $sid\" }",
+  "  if ($rule.AccessControlType -ne $allow) { throw \"Unexpected Deny ACE for SID: $sid\" }",
+  "  if (($rule.FileSystemRights -band $rights) -ne $rights) { throw \"Insufficient rights for SID: $sid\" }",
+  "  $seen[$sid] = $true",
+  "}",
+  "if (-not $seen.ContainsKey($userSid) -or -not $seen.ContainsKey($sysSid)) { throw 'Missing required owner/SYSTEM SID in root DACL' }",
+  "function Reset-ChildAcl([string]$dir) {",
+  "  foreach ($ch in [System.IO.Directory]::GetFileSystemEntries($dir)) {",
+  "    $ca = [System.IO.File]::GetAttributes($ch)",
+  "    if (($ca -band $reparse) -ne 0) { throw \"ReparsePoint rejected: $ch\" }",
+  "    if (($ca -band $dirAttr) -ne 0) {",
+  "      $cAcl = New-Object System.Security.AccessControl.DirectorySecurity",
+  "      $cAcl.SetAccessRuleProtection($false, $false)",
+  "      [System.IO.Directory]::SetAccessControl($ch, $cAcl)",
+  "      Reset-ChildAcl $ch",
+  "    } else {",
+  "      $fAcl = New-Object System.Security.AccessControl.FileSecurity",
+  "      $fAcl.SetAccessRuleProtection($false, $false)",
+  "      [System.IO.File]::SetAccessControl($ch, $fAcl)",
+  "    }",
+  "  }",
+  "}",
+  "Reset-ChildAcl $root",
+].join("\n");
+const WINDOWS_ACL_ENCODED = Buffer.from(WINDOWS_ACL_STATIC_SCRIPT, "utf16le").toString("base64");
+
+function runWindowsAclScript(mode, targetDir) {
+  const psBin = fs.existsSync("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+    ? "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+    : "powershell.exe";
+  const childEnv = {
+    ...process.env,
+    CODEX_BRIDGE_ACL_MODE: mode,
+    CODEX_BRIDGE_ACL_TARGET: path.resolve(targetDir),
+  };
+  delete childEnv.PSModulePath;
+  const res = spawnSync(psBin, ["-NoProfile", "-NonInteractive", "-EncodedCommand", WINDOWS_ACL_ENCODED], {
+    encoding: "utf8",
+    env: childEnv,
+    windowsHide: true,
+    timeout: 15_000,
+  });
+  if (res.status !== 0) {
+    const detail = (res.stderr || res.stdout || "").trim();
+    const clmHint = /ConstrainedLanguage|Cannot invoke method/i.test(detail)
+      ? " (Windows ACL helper requires FullLanguage PowerShell mode)"
+      : "";
+    throw new Error(`Windows ACL/${mode} failed on ${targetDir}${clmHint}: ${detail}`);
+  }
+}
+
+// Validate & canonicalize STATE_DIR BEFORE creating subdirectories or lock file
+let STATE_DIR = RAW_STATE_DIR;
+if (process.platform === "win32") {
+  runWindowsAclScript("check_only", STATE_DIR);
+} else {
+  STATE_DIR = validateAndCanonicalizePosixStatePath(STATE_DIR);
+}
+
 const LOGS_DIR = path.join(STATE_DIR, "logs");
+const HOOKS_DIR = path.join(STATE_DIR, "hooks");
 const STATE_FILE = path.join(STATE_DIR, "daemon.json");
+const HOOK_STATE_FILE = path.join(STATE_DIR, "hook-daemon.json");
 const LOCK_FILE = path.join(STATE_DIR, "daemon.lock");
+const RECLAIM_LOCK_FILE = path.join(STATE_DIR, "daemon.lock.reclaim");
 const DAEMON_LOG = path.join(STATE_DIR, "daemon.log");
 const IDLE_TIMEOUT_MS = Number(process.env.CODEX_BRIDGE_IDLE_MS ?? 60 * 60 * 1000);
+const PROTOCOL_VERSION = 2;
 const MAX_MEM_EVENTS = 500;
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
 const COALESCE_MS = 300;
 const MAX_INLINE_TEXT = 2500;
+const MAX_THREAD_NOTIFS = 50;
+const MAX_GLOBAL_NOTIFS = 500;
+const BATCH_LEASE_MS = Number(process.env.CODEX_BRIDGE_LEASE_MS ?? 30_000);
+const HOOK_NUDGE_COOLDOWN_MS = Number(process.env.CODEX_BRIDGE_NUDGE_COOLDOWN_MS ?? 15_000);
+const FLAG_RETRY_MS = Number(process.env.CODEX_BRIDGE_FLAG_RETRY_MS ?? 5_000);
+const IDLE_SWEEP_MS = Number(process.env.CODEX_BRIDGE_IDLE_SWEEP_MS ?? 60_000);
+const INBOX_MAX_BYTES = 16 * 1024;
+const INBOX_MAX_THREADS = 10;
+const INBOX_MAX_ITEMS = 20;
+const NOTIF_TTL_MS = Number(process.env.CODEX_BRIDGE_NOTIF_TTL_MS ?? 60 * 60 * 1000);
+const NORMAL_STOP_REASONS = new Set(["NO_TOOL_CALL"]);
 const INSTANCE_ID = `${process.pid}-${Date.now()}`;
+const INSTANCE_HOOKS_DIR = path.join(HOOKS_DIR, INSTANCE_ID);
 
-fs.mkdirSync(LOGS_DIR, { recursive: true });
+// Prevent detached daemon from crashing if parent CLI closes stdout/stderr pipes after readiness
+process.stdout.on("error", () => {});
+process.stderr.on("error", () => {});
+
+fs.mkdirSync(LOGS_DIR, { recursive: true, mode: 0o700 });
 
 function logDaemon(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
@@ -37,132 +253,276 @@ function logDaemon(msg) {
 
 /**
  * On Windows, Node's `0o600` does NOT restrict NTFS DACLs, and `%USERPROFILE%`
- * often inherits read access for `CodexSandboxUsers`. Strip inheritance and
- * grant full control ONLY to current user SID + SYSTEM before writing secrets.
+ * often inherits read access for `CodexSandboxUsers`. Replace the root DACL
+ * with ONLY current user SID + SYSTEM via .NET SecurityIdentifier (stripping
+ * both inherited and stray explicit ACEs), verify by SID, then reset children.
  */
 function hardenStateDirPermissions() {
   if (process.platform !== "win32") {
-    try {
-      fs.chmodSync(STATE_DIR, 0o700);
-      fs.chmodSync(LOGS_DIR, 0o700);
-    } catch {}
+    validateAndCanonicalizePosixStatePath(STATE_DIR);
+    fs.chmodSync(STATE_DIR, 0o700);
+    fs.chmodSync(LOGS_DIR, 0o700);
     return;
   }
-
-  const whoami = spawnSync("whoami", ["/user", "/fo", "csv", "/nh"], {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 5000,
-  });
-  if (whoami.status !== 0) {
-    throw new Error(`Failed to resolve current user SID via whoami: ${whoami.stderr || whoami.stdout}`);
-  }
-  const match = (whoami.stdout || "").match(/(S-1-[0-9-]+)/);
-  if (!match) {
-    throw new Error(`Could not parse user SID from whoami output: ${whoami.stdout}`);
-  }
-  const userSid = match[1];
-
-  // 1. Strip inheritance on STATE_DIR itself and grant (OI)(CI)F ONLY to current user + SYSTEM.
-  //    Do NOT pass /T with (OI)(CI) because inheritance flags fail on existing files and leave empty DACLs.
-  const ic = spawnSync(
-    "icacls",
-    [
-      STATE_DIR,
-      "/inheritance:r",
-      "/grant:r",
-      `*${userSid}:(OI)(CI)F`,
-      "*S-1-5-18:(OI)(CI)F", // NT AUTHORITY\SYSTEM
-    ],
-    { encoding: "utf8", windowsHide: true, timeout: 10000 }
-  );
-  if (ic.status !== 0) {
-    throw new Error(`Failed to harden NTFS DACL on ${STATE_DIR}: ${ic.stderr || ic.stdout}`);
-  }
-
-  // 2. Reset children so any pre-existing files/subdirs cleanly inherit STATE_DIR's private DACL
-  for (const entry of fs.readdirSync(STATE_DIR)) {
-    const childPath = path.join(STATE_DIR, entry);
-    const resetRes = spawnSync("icacls", [childPath, "/reset", "/T", "/C"], {
-      encoding: "utf8",
-      windowsHide: true,
-      timeout: 10000,
-    });
-    if (resetRes.status !== 0) {
-      throw new Error(`Failed to reset NTFS DACL on ${childPath}: ${resetRes.stderr || resetRes.stdout}`);
-    }
-  }
-
-  // 3. Verify ONLY current user and SYSTEM appear on STATE_DIR (no CodexSandboxUsers or extra principals)
-  const verify = spawnSync("icacls", [STATE_DIR], { encoding: "utf8", windowsHide: true, timeout: 5000 });
-  if (verify.status !== 0 || /CodexSandboxUsers|Everyone|Users:/i.test(verify.stdout || "")) {
-    throw new Error(`NTFS DACL verification failed on ${STATE_DIR}: ${verify.stdout || verify.stderr}`);
-  }
+  runWindowsAclScript("harden", STATE_DIR);
 }
 
 function isPidAlive(pid) {
-  if (!pid || typeof pid !== "number") return false;
+  if (!Number.isInteger(pid) || pid <= 0) return false;
   try {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return e && e.code === "EPERM";
+    return Boolean(e && e.code === "EPERM");
   }
 }
 
-let ownsLock = false;
-function acquireStartupLock() {
-  for (let attempt = 0; attempt < 3; attempt++) {
+function isPidDefinitelyDead(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (e) {
+    return Boolean(e && e.code === "ESRCH");
+  }
+}
+
+function inspectLockStaleness() {
+  try {
+    const info = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
+    if (isPidAlive(info.pid)) {
+      return { stale: false, missing: false };
+    }
+    return { stale: isPidDefinitelyDead(info.pid), missing: false };
+  } catch (err) {
+    if (err && err.code === "ENOENT") return { stale: false, missing: true };
+    // Corrupt or mid-write lock: treat as stale only if older than 5s
     try {
-      const fd = fs.openSync(LOCK_FILE, "wx");
-      fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, instanceId: INSTANCE_ID, startedAt: new Date().toISOString() }), "utf8");
-      fs.closeSync(fd);
-      ownsLock = true;
+      const st = fs.statSync(LOCK_FILE);
+      return { stale: Date.now() - st.mtimeMs >= 5000, missing: false };
+    } catch (stErr) {
+      if (stErr && stErr.code === "ENOENT") return { stale: false, missing: true };
+      return { stale: false, missing: false };
+    }
+  }
+}
+
+function writeNewStartupLockExclusive() {
+  const fd = fs.openSync(LOCK_FILE, "wx", 0o600);
+  let closed = false;
+  try {
+    fs.writeFileSync(
+      fd,
+      JSON.stringify({ pid: process.pid, instanceId: INSTANCE_ID, startedAt: new Date().toISOString() }),
+      "utf8"
+    );
+    fs.closeSync(fd);
+    closed = true;
+  } catch (err) {
+    if (!closed) {
+      try { fs.closeSync(fd); } catch {}
+    }
+    try { fs.unlinkSync(LOCK_FILE); } catch {}
+    throw err;
+  }
+  ownsLock = true;
+}
+
+let ownsLock = false;
+let winMutexServer = null;
+
+function computeWindowsPhysicalPipeKey(dirPath) {
+  // Deterministic single physical identity: fail loudly if realpath/stat fails (never silently diverge between two contenders)
+  const canonical = fs.realpathSync.native(dirPath);
+  const st = fs.statSync(canonical, { bigint: true });
+  const identity = st.ino > 0n ? `id:${st.dev}:${st.ino}` : `path:${canonical.toLowerCase()}`;
+  return crypto.createHash("sha256").update(identity).digest("hex").slice(0, 32);
+}
+
+function acquireWindowsKernelMutex() {
+  const hash = computeWindowsPhysicalPipeKey(STATE_DIR);
+  const pipePath = `\\\\.\\pipe\\codex-supervisor-lock-${hash}`;
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer((sock) => {
+      try { sock.destroy(); } catch {}
+    });
+    const onErr = (err) => {
+      if (err && err.code === "EADDRINUSE") {
+        resolve(false);
+      } else {
+        reject(err);
+      }
+    };
+    srv.once("error", onErr);
+    srv.listen({ path: pipePath, exclusive: true }, () => {
+      srv.off("error", onErr);
+      srv.on("error", () => {});
+      // Mixed-version compatibility: acquire LOCK_FILE via shared exclusive `wx` protocol
+      // so a legacy v1 daemon (without named pipe) racing on `wx` is NEVER overwritten.
+      // Never auto-unlink an existing stale LOCK_FILE on Windows because a concurrent legacy v1
+      // daemon does not participate in the named pipe and could replace LOCK_FILE before unlink.
+      const releaseAndYield = () => {
+        try { srv.close(); } catch {}
+        resolve(false);
+      };
+      try {
+        try {
+          writeNewStartupLockExclusive();
+        } catch (wErr) {
+          if (!wErr || wErr.code !== "EEXIST") throw wErr;
+          const legacyCheck = inspectLockStaleness();
+          if (legacyCheck.missing) {
+            // Disappeared concurrently; retry exclusive wx once without unlinking anything
+            try {
+              writeNewStartupLockExclusive();
+            } catch (wErr2) {
+              if (wErr2 && wErr2.code === "EEXIST") return releaseAndYield();
+              throw wErr2;
+            }
+          } else if (!legacyCheck.stale) {
+            return releaseAndYield();
+          } else {
+            throw new Error(
+              `Stale lock file exists at ${LOCK_FILE}; refusing uncoordinated auto-removal for mixed-version safety. Remove it manually if no daemon is running.`
+            );
+          }
+        }
+      } catch (err) {
+        try { srv.close(); } catch {}
+        return reject(err);
+      }
+
+      srv.unref();
+      winMutexServer = srv;
+      resolve(true);
+    });
+  });
+}
+
+async function acquireStartupLock() {
+  // On Windows, use an OS-kernel-enforced exclusive named pipe keyed by physical directory identity
+  // (FILE_FLAG_FIRST_PIPE_INSTANCE): automatically released by the kernel on ANY process death.
+  if (process.platform === "win32") {
+    return await acquireWindowsKernelMutex();
+  }
+
+  // POSIX fallback: exclusive LOCK_FILE + non-racy RECLAIM_LOCK_FILE (never auto-unlinks another contender's reclaim lock)
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      writeNewStartupLockExclusive();
       return true;
     } catch (err) {
       if (err.code !== "EEXIST") throw err;
-      let stale = false;
+      const check = inspectLockStaleness();
+      if (check.missing) continue;
+      if (!check.stale) return false; // Live daemon owns the lock
+
+      let rfd = null;
+      let reclaimAcquired = false;
       try {
-        const info = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
-        if (isPidAlive(info.pid)) {
-          return false; // Another healthy daemon owns the lock
-        }
-        stale = true;
-      } catch {
-        // Corrupt or mid-write lock; treat as stale only if older than 5s
-        try {
-          const st = fs.statSync(LOCK_FILE);
-          if (Date.now() - st.mtimeMs >= 5000) stale = true;
-          else return false;
-        } catch {
-          // Lock vanished in the meantime; retry wx
-          continue;
-        }
+        rfd = fs.openSync(RECLAIM_LOCK_FILE, "wx", 0o600);
+        reclaimAcquired = true;
+      } catch (rErr) {
+        if (rErr.code !== "EEXIST") throw rErr;
+        // Another contender holds RECLAIM_LOCK_FILE; wait briefly and re-check LOCK_FILE without touching RECLAIM_LOCK_FILE
+        await new Promise((r) => setTimeout(r, 40));
+        continue;
       }
-      if (stale) {
-        // Atomically claim stale lock via rename so two contenders cannot unlink a fresh holder's lock
-        const claimPath = `${LOCK_FILE}.stale.${process.pid}.${Date.now()}`;
+
+      try {
+        let rClosed = false;
         try {
-          fs.renameSync(LOCK_FILE, claimPath);
+          fs.writeFileSync(rfd, JSON.stringify({ pid: process.pid, instanceId: INSTANCE_ID }), "utf8");
+          fs.closeSync(rfd);
+          rClosed = true;
+        } finally {
+          if (!rClosed && rfd !== null) {
+            try { fs.closeSync(rfd); } catch {}
+          }
+        }
+
+        const recheck = inspectLockStaleness();
+        if (!recheck.missing && !recheck.stale) {
+          return false; // Another contender installed a live lock
+        }
+        if (!recheck.missing) {
           try {
-            fs.unlinkSync(claimPath);
-          } catch {}
-        } catch {
-          // Another contender already reclaimed/replaced it; retry once
+            fs.unlinkSync(LOCK_FILE);
+          } catch (uErr) {
+            if (!uErr || uErr.code !== "ENOENT") throw uErr;
+          }
+        }
+        try {
+          writeNewStartupLockExclusive();
+          return true;
+        } catch (wErr) {
+          if (wErr && wErr.code === "EEXIST") {
+            return false; // Another contender won the race cleanly
+          }
+          throw wErr;
+        }
+      } finally {
+        if (reclaimAcquired) {
+          try { fs.unlinkSync(RECLAIM_LOCK_FILE); } catch {}
         }
       }
     }
   }
+  if (fs.existsSync(RECLAIM_LOCK_FILE)) {
+    throw new Error(
+      `Stale startup reclaim lock exists at ${RECLAIM_LOCK_FILE}; refusing unsafe auto-steal. Remove it manually if no daemon is starting.`
+    );
+  }
   return false;
 }
 
-if (!acquireStartupLock()) {
-  console.log(JSON.stringify({ alreadyRunning: true }));
+if (!(await acquireStartupLock())) {
+  // Flush stdout cleanly before exiting so parent CLI always reads complete {"alreadyRunning":true}
+  await new Promise((resolve) => {
+    const fallback = setTimeout(resolve, 200);
+    fallback.unref();
+    process.stdout.write(JSON.stringify({ alreadyRunning: true }) + "\n", () => {
+      clearTimeout(fallback);
+      resolve();
+    });
+  });
   process.exit(0);
 }
 
-// Harden NTFS DACL ONLY after owning the startup lock, and BEFORE writing daemon.json secrets
+// Harden NTFS DACL ONLY after owning the startup lock, and BEFORE creating HOOKS_DIR or writing secrets
 hardenStateDirPermissions();
+
+function initInstanceHooksDir() {
+  fs.mkdirSync(HOOKS_DIR, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(INSTANCE_HOOKS_DIR, { recursive: true, mode: 0o700 });
+  if (process.platform !== "win32") {
+    try {
+      fs.chmodSync(HOOKS_DIR, 0o700);
+      fs.chmodSync(INSTANCE_HOOKS_DIR, 0o700);
+    } catch {}
+  }
+  // Conservatively prune stale subdirs (>24h old & confirmed dead via ESRCH) without touching live or EPERM instances
+  try {
+    const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+    for (const entry of fs.readdirSync(HOOKS_DIR)) {
+      if (entry === INSTANCE_ID) continue;
+      const m = entry.match(/^(\d+)-\d+$/);
+      if (!m) continue;
+      const full = path.join(HOOKS_DIR, entry);
+      try {
+        const lst = fs.lstatSync(full);
+        if (lst.isSymbolicLink() || !lst.isDirectory()) continue;
+        if (lst.mtimeMs > cutoff) continue;
+        const oldPid = Number(m[1]);
+        if (isPidDefinitelyDead(oldPid)) {
+          fs.rmSync(full, { recursive: true, force: true });
+        }
+      } catch {}
+    }
+  } catch {}
+}
+
+initInstanceHooksDir();
 
 function findCodexBin() {
   if (process.env.CODEX_BIN && fs.existsSync(process.env.CODEX_BIN)) {
@@ -238,6 +598,7 @@ function normalizeCwd(p) {
 // ---------- State ----------
 const codexBin = findCodexBin();
 const authToken = crypto.randomBytes(24).toString("hex");
+const hookToken = crypto.randomBytes(24).toString("hex");
 let lastActivityMs = Date.now();
 let shuttingDown = false;
 
@@ -248,10 +609,397 @@ let rpcNextId = 1;
 const pendingRpc = new Map();
 
 let serverReqNextSeq = 1;
+let nextOwnerGen = 1;
+let nextNotifId = 1;
+let nextBatchSeq = 1;
+let inboxRotateOffset = 0;
 const pendingServerRequests = new Map(); // reqId (string `${INSTANCE_ID}:${seq}`) -> entry
 const threads = new Map(); // threadId -> ThreadState
+const threadOwners = new Map(); // threadId -> { ownerConversationId, ownerGen } (preserved across idle eviction)
 const evictedThreadSeq = new Map(); // threadId -> last nextSeq before idle eviction
 const threadLocks = new Map(); // threadId -> Promise chain
+const activeBatches = new Map(); // batchId -> { batchId, instanceId, conversationId, expiresAt, entries }
+const convFlagCache = new Map(); // conversationId -> { unread: boolean, active: boolean }
+const flagDirty = new Set(); // Set<conversationId> whose disk flag sync failed
+const convNudgeState = new Map(); // conversationId -> { signature: string, lastNudgeAt: number }
+let flagRetryLogLastMs = 0;
+
+function parseOptionalConversationId(val) {
+  if (val === undefined || val === null || val === "") return null;
+  if (typeof val !== "string") {
+    const err = new Error("Invalid conversationId: must be a string");
+    err.statusCode = 400;
+    throw err;
+  }
+  const trimmed = val.trim();
+  if (trimmed.length === 0) return null;
+  if (trimmed.length > 256) {
+    const err = new Error("Invalid conversationId: exceeds 256 characters");
+    err.statusCode = 400;
+    throw err;
+  }
+  return trimmed;
+}
+
+function normalizeConversationId(val) {
+  if (typeof val !== "string") return null;
+  const trimmed = val.trim();
+  return trimmed.length > 0 && trimmed.length <= 256 ? trimmed : null;
+}
+
+function convFlagKey(conversationId) {
+  return crypto.createHash("sha256").update(String(conversationId)).digest("hex").slice(0, 32);
+}
+
+function setThreadOwnerRecord(threadId, ownerConversationId, ownerGen) {
+  if (!threadId || threadId === "unknown") return;
+  // Preserve valid ownership for the entire daemon instance lifetime (never silently evict)
+  threadOwners.set(threadId, { ownerConversationId: ownerConversationId || null, ownerGen });
+}
+
+function bindNewThreadOwner(st, rawConvId) {
+  const convId = normalizeConversationId(rawConvId);
+  const prevOwner = st.ownerConversationId;
+  st.ownerConversationId = convId;
+  st.ownerGen = nextOwnerGen++;
+  setThreadOwnerRecord(st.threadId, st.ownerConversationId, st.ownerGen);
+  if (prevOwner && prevOwner !== st.ownerConversationId) refreshConversationFlags(prevOwner);
+  if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
+}
+
+function hasActiveBatchForThread(threadId, now = Date.now()) {
+  for (const b of activeBatches.values()) {
+    if (now >= b.expiresAt) continue;
+    if (b.entries.some((e) => e.threadId === threadId)) return true;
+  }
+  return false;
+}
+
+function hasUnexpiredNotificationOrOverflow(st, now = Date.now()) {
+  if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen && now - n.createdAtMs < NOTIF_TTL_MS)) {
+    return true;
+  }
+  if (st.overflowTotal > st.overflowAckedThrough && (st.overflowUpdatedAtMs === 0 || now - st.overflowUpdatedAtMs < NOTIF_TTL_MS)) {
+    return true;
+  }
+  return false;
+}
+
+function syncFlagFile(filePath, wantExist) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      if (wantExist) {
+        fs.writeFileSync(filePath, "", { mode: 0o600 });
+      } else {
+        try {
+          fs.unlinkSync(filePath);
+        } catch (err) {
+          if (err && err.code !== "ENOENT") throw err;
+        }
+      }
+      return true;
+    } catch (err) {
+      if (attempt < 2 && err && (err.code === "EPERM" || err.code === "EBUSY")) {
+        continue;
+      }
+      const now = Date.now();
+      if (now - flagRetryLogLastMs > 30_000) {
+        flagRetryLogLastMs = now;
+        logDaemon(`Flag sync failed (${wantExist ? "create" : "unlink"} ${filePath}): ${err.message}`);
+      }
+      return false;
+    }
+  }
+  return false;
+}
+
+function isWaiterConnected(w) {
+  return Boolean(w && w.res && !w.res.destroyed && !w.res.writableEnded);
+}
+
+function isEligibleWaiterBase(st, w) {
+  return Boolean(
+    isWaiterConnected(w) &&
+      st.ownerConversationId !== null &&
+      w.ownerConversationId === st.ownerConversationId &&
+      w.ownerGen === st.ownerGen
+  );
+}
+
+function hasEligibleWaiterForEvent(st, seq, level = "critical") {
+  for (const w of st.waiters) {
+    if (isEligibleWaiterBase(st, w) && seq > w.afterSeq && levelMatches(level, w.eventsFilter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEligibleWaiterForPending(st, reqEntry = null) {
+  const reqSeq = reqEntry?.eventSeq || 0;
+  for (const w of st.waiters) {
+    if (!isEligibleWaiterBase(st, w)) continue;
+    // Ahead-of-head waiter (afterSeq >= eventSeq) will NOT receive this request in pushEvent and MUST NOT suppress Hook
+    if (reqSeq > 0) {
+      if (reqSeq > w.afterSeq) return true;
+    } else if (w.afterSeq <= st.nextSeq - 1) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasEligibleWaiterForFuture(st) {
+  const headSeq = st.nextSeq - 1;
+  for (const w of st.waiters) {
+    if (isEligibleWaiterBase(st, w) && w.afterSeq <= headSeq && levelMatches("critical", w.eventsFilter)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function computeConversationFlagState(conversationId) {
+  let wantUnread = false;
+  let wantActive = false;
+  for (const st of threads.values()) {
+    if (st.ownerConversationId !== conversationId) continue;
+    const hasNotif = st.hookNotifications.some((n) => n.ownerGen === st.ownerGen);
+    const hasOverflow = st.overflowTotal > st.overflowAckedThrough;
+    let hasPending = false;
+    for (const r of pendingServerRequests.values()) {
+      if (r.threadId === st.threadId && r.ownerGen === st.ownerGen) {
+        hasPending = true;
+        break;
+      }
+    }
+    if (hasNotif || hasOverflow || hasPending) {
+      wantUnread = true;
+    }
+    if (hasPending || (st.status === "running" && !hasEligibleWaiterForFuture(st))) {
+      wantActive = true;
+    }
+    if (wantUnread && wantActive) break;
+  }
+  return { unread: wantUnread, active: wantActive };
+}
+
+function refreshConversationFlags(conversationId, force = false) {
+  if (!conversationId || shuttingDown) return;
+  const desired = computeConversationFlagState(conversationId);
+  const prev = convFlagCache.get(conversationId);
+  if (!force && !flagDirty.has(conversationId) && prev && prev.unread === desired.unread && prev.active === desired.active) {
+    return;
+  }
+  const key = convFlagKey(conversationId);
+  const unreadPath = path.join(INSTANCE_HOOKS_DIR, `unread-${key}.flag`);
+  const activePath = path.join(INSTANCE_HOOKS_DIR, `active-${key}.flag`);
+  const ok1 = syncFlagFile(unreadPath, desired.unread);
+  const ok2 = syncFlagFile(activePath, desired.active);
+  if (ok1 && ok2) {
+    if (!desired.unread && !desired.active) {
+      convFlagCache.delete(conversationId);
+    } else {
+      convFlagCache.set(conversationId, desired);
+    }
+    flagDirty.delete(conversationId);
+  } else {
+    flagDirty.add(conversationId);
+  }
+}
+
+function recordOverflow(st, count = 1, now = Date.now()) {
+  st.overflowTotal += count;
+  st.overflowUpdatedAtMs = now;
+}
+
+function normalizeNotificationKind(kind, data) {
+  if (kind === "turn_completed" && data?.status === "interrupted") return "turn_interrupted";
+  return kind;
+}
+
+const HOOK_NOTIFICATION_KINDS = new Set(["supervisor_message", "turn_completed", "turn_error", "daemon_error"]);
+
+function buildCompactNotifData(normKind, data) {
+  const out = {};
+  if (normKind === "supervisor_message") {
+    out.message = truncateText(String(data?.message || ""), MAX_INLINE_TEXT);
+    if (data?.truncated) out.truncated = true;
+  } else if (normKind === "turn_completed" || normKind === "turn_interrupted") {
+    if (data?.status) out.status = data.status;
+    if (data?.lastMessage) out.message = truncateText(String(data.lastMessage), MAX_INLINE_TEXT);
+    if (Array.isArray(data?.turnFiles) && data.turnFiles.length > 0) out.files = data.turnFiles.slice(0, 20);
+    if (data?.turnCommandsCount) out.turnCommandsCount = data.turnCommandsCount;
+  } else if (normKind === "turn_error" || normKind === "daemon_error") {
+    const errVal = data?.error?.message || data?.error || data?.message || "Unknown error";
+    out.error = truncateText(String(typeof errVal === "string" ? errVal : JSON.stringify(errVal)), 1200);
+    if (data?.lastMessage) out.message = truncateText(String(data.lastMessage), MAX_INLINE_TEXT);
+  }
+  return out;
+}
+
+function evictOneFromThreadNotifs(st, now) {
+  if (st.hookNotifications.length === 0) return false;
+  const isUnleased = (n) => !n.leaseBatchId || now >= n.leaseUntil;
+  // Prefer evicting unleased supervisor_message -> unleased non-terminal -> unleased oldest -> leased supervisor_message -> oldest
+  let idx = st.hookNotifications.findIndex((n) => n.kind === "supervisor_message" && isUnleased(n));
+  if (idx === -1) idx = st.hookNotifications.findIndex((n) => isUnleased(n));
+  if (idx === -1) idx = st.hookNotifications.findIndex((n) => n.kind === "supervisor_message");
+  if (idx === -1) idx = 0;
+  st.hookNotifications.splice(idx, 1);
+  recordOverflow(st, 1, now);
+  return true;
+}
+
+function enforceGlobalNotifCap(now = Date.now()) {
+  let total = 0;
+  for (const st of threads.values()) total += st.hookNotifications.length;
+  const isUnleased = (n) => !n.leaseBatchId || now >= n.leaseUntil;
+  const pickVictim = (predicate) => {
+    let victimSt = null;
+    let victimIdx = -1;
+    let victimTs = Infinity;
+    for (const st of threads.values()) {
+      for (let i = 0; i < st.hookNotifications.length; i++) {
+        const n = st.hookNotifications[i];
+        if (predicate(n) && n.createdAtMs < victimTs) {
+          victimSt = st;
+          victimIdx = i;
+          victimTs = n.createdAtMs;
+        }
+      }
+    }
+    return victimSt ? { victimSt, victimIdx } : null;
+  };
+  while (total > MAX_GLOBAL_NOTIFS) {
+    const picked =
+      pickVictim((n) => n.kind === "supervisor_message" && isUnleased(n)) ||
+      pickVictim((n) => isUnleased(n)) ||
+      pickVictim((n) => n.kind === "supervisor_message") ||
+      pickVictim(() => true);
+    if (!picked) break;
+    picked.victimSt.hookNotifications.splice(picked.victimIdx, 1);
+    recordOverflow(picked.victimSt, 1, now);
+    total--;
+    if (picked.victimSt.ownerConversationId) refreshConversationFlags(picked.victimSt.ownerConversationId);
+  }
+}
+
+function enqueueHookNotification(st, ev) {
+  if (!HOOK_NOTIFICATION_KINDS.has(ev.kind)) return null;
+  const now = Date.now();
+  const normKind = normalizeNotificationKind(ev.kind, ev.data);
+  const item = {
+    notifId: `${INSTANCE_ID}:n${nextNotifId++}`,
+    seq: ev.seq,
+    kind: normKind,
+    turnId: ev.turnId || null,
+    ownerGen: st.ownerGen,
+    data: buildCompactNotifData(normKind, ev.data),
+    createdAtMs: now,
+    leaseBatchId: null,
+    leaseUntil: 0,
+  };
+  st.hookNotifications.push(item);
+  while (st.hookNotifications.length > MAX_THREAD_NOTIFS) {
+    if (!evictOneFromThreadNotifs(st, now)) break;
+  }
+  enforceGlobalNotifCap(now);
+  return item;
+}
+
+function pruneExpiredBatchesAndNotifications(now = Date.now()) {
+  const affectedConvs = new Set();
+  for (const [bid, batch] of activeBatches.entries()) {
+    if (now >= batch.expiresAt) {
+      activeBatches.delete(bid);
+      if (batch.conversationId) affectedConvs.add(batch.conversationId);
+    }
+  }
+  for (const st of threads.values()) {
+    let changed = false;
+    for (let i = st.hookNotifications.length - 1; i >= 0; i--) {
+      const n = st.hookNotifications[i];
+      if (n.leaseBatchId && now >= n.leaseUntil) {
+        n.leaseBatchId = null;
+        n.leaseUntil = 0;
+      }
+      if (now - n.createdAtMs >= NOTIF_TTL_MS) {
+        st.hookNotifications.splice(i, 1);
+        recordOverflow(st, 1, now);
+        changed = true;
+      }
+    }
+    if (st.overflowTotal > st.overflowAckedThrough && st.overflowUpdatedAtMs > 0 && now - st.overflowUpdatedAtMs >= NOTIF_TTL_MS) {
+      st.overflowAckedThrough = st.overflowTotal;
+      changed = true;
+    }
+    if (changed && st.ownerConversationId) affectedConvs.add(st.ownerConversationId);
+  }
+  for (const c of affectedConvs) refreshConversationFlags(c);
+}
+
+/**
+ * Unified synchronous batch issuance shared by `/inbox` and `/wait`.
+ * Only leases notifications that currently have NO unexpired lease; first channel wins.
+ */
+function issueAckBatch(conversationId, candidates, now = Date.now()) {
+  pruneExpiredBatchesAndNotifications(now);
+  const entries = [];
+  const toLease = [];
+
+  for (const cand of candidates) {
+    const { st, notifIds = [], pendingReqIds = [], includeOverflow = false } = cand;
+    if (!st) continue;
+    const wantedNotifSet = new Set(notifIds);
+    const leasedNotifIds = [];
+    for (const n of st.hookNotifications) {
+      if (n.ownerGen !== st.ownerGen) continue;
+      if (!wantedNotifSet.has(n.notifId)) continue;
+      if (n.leaseBatchId && now < n.leaseUntil) continue; // Already held by another active batch
+      leasedNotifIds.push(n.notifId);
+      toLease.push(n);
+    }
+
+    const validPendingIds = [];
+    for (const reqId of pendingReqIds) {
+      const r = pendingServerRequests.get(reqId);
+      if (r && r.threadId === st.threadId && r.ownerGen === st.ownerGen) {
+        validPendingIds.push(reqId);
+      }
+    }
+
+    const overflowThrough = includeOverflow && st.overflowTotal > st.overflowAckedThrough ? st.overflowTotal : 0;
+
+    if (leasedNotifIds.length > 0 || validPendingIds.length > 0 || overflowThrough > 0) {
+      entries.push({
+        threadId: st.threadId,
+        ownerGen: st.ownerGen,
+        notifIds: leasedNotifIds,
+        overflowThrough,
+        pendingReqIds: validPendingIds,
+      });
+    }
+  }
+
+  if (entries.length === 0) return null;
+
+  const batchId = `${INSTANCE_ID}:b${nextBatchSeq++}`;
+  const expiresAt = now + BATCH_LEASE_MS;
+  for (const n of toLease) {
+    n.leaseBatchId = batchId;
+    n.leaseUntil = expiresAt;
+  }
+
+  activeBatches.set(batchId, {
+    batchId,
+    instanceId: INSTANCE_ID,
+    conversationId: conversationId || null,
+    expiresAt,
+    entries,
+  });
+  return { batchId, expiresAt };
+}
 
 function withThreadLock(threadId, fn) {
   const prev = threadLocks.get(threadId) || Promise.resolve();
@@ -271,8 +1019,11 @@ function getThreadState(threadId) {
   let st = threads.get(threadId);
   if (!st) {
     const logPath = path.join(LOGS_DIR, `${threadId.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
+    const savedOwner = threadOwners.get(threadId);
     st = {
       threadId,
+      ownerConversationId: savedOwner?.ownerConversationId ?? null,
+      ownerGen: savedOwner?.ownerGen ?? 0,
       name: null,
       cwd: null,
       model: null,
@@ -299,6 +1050,10 @@ function getThreadState(threadId) {
       nextSeq: evictedThreadSeq.get(threadId) || 1,
       evictedBefore: evictedThreadSeq.has(threadId),
       events: [],
+      hookNotifications: [],
+      overflowTotal: 0,
+      overflowAckedThrough: 0,
+      overflowUpdatedAtMs: 0,
       waiters: new Set(),
       logPath,
       updatedAt: Date.now(),
@@ -371,6 +1126,7 @@ function cleanupWaiter(st, waiter) {
   if (waiter.onClose) {
     waiter.res.off("close", waiter.onClose);
   }
+  if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
   return true;
 }
 
@@ -381,9 +1137,11 @@ function compactRequest(r) {
       reqId: r.reqId,
       tool: "message_supervisor",
       message: truncateText(String(r.supervisorMessage || ""), MAX_INLINE_TEXT),
+      ...(r.submitting ? { submitting: true } : {}),
     };
   }
   const out = { reqId: r.reqId, method: r.method };
+  if (r.submitting) out.submitting = true;
   if (p.reason) out.reason = p.reason;
   if (p.command) {
     const cmdStr = String(p.command);
@@ -405,7 +1163,7 @@ function compactRequest(r) {
   return out;
 }
 
-function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
+function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter, rendered = null }) {
   const latestSeq = st.nextSeq - 1;
   const pending = listPendingRequests(st.threadId).map(compactRequest);
   const actualTimedOut = matched.length > 0 ? false : Boolean(timedOut);
@@ -416,12 +1174,15 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   const msgEvs = matched.filter((e) => e.kind === "agent_message");
   const planEv = [...matched].reverse().find((e) => e.kind === "plan_updated");
 
-  const summarizeTerminal = (ev) => ({
-    kind: ev.kind === "turn_completed" && ev.data?.status === "interrupted" ? "turn_interrupted" : ev.kind,
-    turnId: ev.turnId || undefined,
-    ...(ev.data?.lastMessage ? { message: ev.data.lastMessage } : {}),
-    ...(ev.data?.error ? { error: ev.data.error?.message || ev.data.error } : {}),
-  });
+  const summarizeTerminal = (ev) => {
+    const errVal = ev.data?.error?.message || ev.data?.error || (ev.kind === "daemon_error" ? ev.data?.message : null);
+    return {
+      kind: ev.kind === "turn_completed" && ev.data?.status === "interrupted" ? "turn_interrupted" : ev.kind,
+      turnId: ev.turnId || undefined,
+      ...(ev.data?.lastMessage ? { message: ev.data.lastMessage } : {}),
+      ...(errVal ? { error: errVal } : {}),
+    };
+  };
 
   let wakeup = "idle";
   if (gap.cursorGap) {
@@ -457,16 +1218,28 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
 
   if (wakeup === "approval_request" || wakeup === "user_input_request" || wakeup === "supervisor_question") {
     out.requests = pending;
+    if (rendered) {
+      for (const r of pending) rendered.reqIds.add(r.reqId);
+    }
     // Never silently drop supervisor_message events that arrived in the same batch before a pending request
     if (supMsgEvs.length > 0) {
       out.supervisorMessages = supMsgEvs.map((e) => e.data.message);
+      if (rendered) {
+        for (const e of supMsgEvs) rendered.notifSeqs.add(e.seq);
+      }
     }
     // If any terminal event coexists with a pending request, include full message/error summary so nothing is lost
     if (terminalEvs.length > 0) {
       out.terminalEvents = terminalEvs.map(summarizeTerminal);
+      if (rendered) {
+        for (const e of terminalEvs) rendered.notifSeqs.add(e.seq);
+      }
     }
   } else if (wakeup === "supervisor_message" && supMsgEvs.length > 0) {
     out.message = supMsgEvs.length === 1 ? supMsgEvs[0].data.message : supMsgEvs.map((e) => e.data.message).join("\n---\n");
+    if (rendered) {
+      for (const e of supMsgEvs) rendered.notifSeqs.add(e.seq);
+    }
     if (supMsgEvs.some((e) => e.data.truncated)) {
       out.truncated = true;
       out.logPath = st.logPath;
@@ -474,8 +1247,14 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   } else if (wakeup === "turn_completed" && terminalEv) {
     const msg = terminalEv.data?.lastMessage || "";
     if (msg) out.message = msg;
+    if (rendered) {
+      for (const e of terminalEvs) rendered.notifSeqs.add(e.seq);
+    }
     if (supMsgEvs.length > 0) {
       out.supervisorMessages = supMsgEvs.map((e) => e.data.message);
+      if (rendered) {
+        for (const e of supMsgEvs) rendered.notifSeqs.add(e.seq);
+      }
     }
     if (terminalEvs.length > 1) {
       out.earlierTerminalEvents = terminalEvs.slice(0, -1).map(summarizeTerminal);
@@ -488,8 +1267,14 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   } else if (wakeup === "turn_interrupted") {
     const msg = terminalEv?.data?.lastMessage || "";
     if (msg) out.message = msg;
+    if (rendered) {
+      for (const e of terminalEvs) rendered.notifSeqs.add(e.seq);
+    }
     if (supMsgEvs.length > 0) {
       out.supervisorMessages = supMsgEvs.map((e) => e.data.message);
+      if (rendered) {
+        for (const e of supMsgEvs) rendered.notifSeqs.add(e.seq);
+      }
     }
     if (terminalEvs.length > 1) {
       out.earlierTerminalEvents = terminalEvs.slice(0, -1).map(summarizeTerminal);
@@ -497,8 +1282,14 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   } else if ((wakeup === "turn_error" || wakeup === "daemon_error") && terminalEv) {
     out.error = terminalEv.data?.error?.message || terminalEv.data?.error || st.lastError;
     if (terminalEv.data?.lastMessage) out.message = terminalEv.data.lastMessage;
+    if (rendered) {
+      for (const e of terminalEvs) rendered.notifSeqs.add(e.seq);
+    }
     if (supMsgEvs.length > 0) {
       out.supervisorMessages = supMsgEvs.map((e) => e.data.message);
+      if (rendered) {
+        for (const e of supMsgEvs) rendered.notifSeqs.add(e.seq);
+      }
     }
     if (terminalEvs.length > 1) {
       out.earlierTerminalEvents = terminalEvs.slice(0, -1).map(summarizeTerminal);
@@ -520,7 +1311,12 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   } else if (wakeup === "cursor_gap") {
     out.reason = gap.cursorGapReason;
     out.status = st.status;
-    if (pending.length > 0) out.requests = pending;
+    if (pending.length > 0) {
+      out.requests = pending;
+      if (rendered) {
+        for (const r of pending) rendered.reqIds.add(r.reqId);
+      }
+    }
     if (st.lastMessage) out.message = truncateText(st.lastMessage, 600);
     if (st.lastError) out.error = st.lastError?.message || st.lastError;
   } else if (wakeup === "idle" && st.lastMessage) {
@@ -528,6 +1324,7 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   }
 
   // Only include granular timeline when caller explicitly requests `--events all`
+  // Note: seq/kind-only timeline rows do NOT count as rendered notification bodies for ACK.
   if (eventsFilter === "all" && matched.length > 0) {
     out.events = matched.map((e) => ({
       seq: e.seq,
@@ -542,11 +1339,42 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter }) {
   return out;
 }
 
+function attachWaitAckBatch(st, payload, rendered, { supportsAckBatch, ownerConversationId, ownerGen }) {
+  if (!supportsAckBatch) return payload;
+  if (!st.ownerConversationId || ownerConversationId !== st.ownerConversationId || ownerGen !== st.ownerGen) {
+    return payload;
+  }
+  const notifIds = [];
+  if (rendered.notifSeqs.size > 0) {
+    for (const n of st.hookNotifications) {
+      if (n.ownerGen === st.ownerGen && rendered.notifSeqs.has(n.seq)) {
+        notifIds.push(n.notifId);
+      }
+    }
+  }
+  const pendingReqIds = Array.from(rendered.reqIds);
+  if (notifIds.length === 0 && pendingReqIds.length === 0) return payload;
+
+  const batch = issueAckBatch(ownerConversationId, [
+    { st, notifIds, pendingReqIds, includeOverflow: false },
+  ]);
+  if (batch) {
+    payload.ackBatchId = batch.batchId;
+    payload.ackExpiresAt = batch.expiresAt;
+  }
+  return payload;
+}
+
 function resolveWaiter(st, waiter, timedOut = false) {
   if (!cleanupWaiter(st, waiter)) return;
   const matched = st.events.filter((e) => e.seq > waiter.afterSeq && levelMatches(e.level, waiter.eventsFilter));
   const gap = detectCursorGap(st, waiter.afterSeq, waiter.afterProvided, waiter.instanceMismatch);
-  waiter.resolve(buildWaitPayload(st, { timedOut, matched, gap, eventsFilter: waiter.eventsFilter }));
+  const rendered = { notifSeqs: new Set(), reqIds: new Set() };
+  const payload = buildWaitPayload(st, { timedOut, matched, gap, eventsFilter: waiter.eventsFilter, rendered });
+  if (isWaiterConnected(waiter)) {
+    attachWaitAckBatch(st, payload, rendered, waiter);
+  }
+  waiter.resolve(payload);
 }
 
 function pushEvent(threadId, level, kind, turnId, data) {
@@ -567,6 +1395,11 @@ function pushEvent(threadId, level, kind, turnId, data) {
   }
   appendThreadLog(st, { kind: `event:${kind}`, level, turnId: ev.turnId, data });
 
+  // Invariant 1: ALWAYS record target critical notifications first, even when eligible waiters exist
+  if (level === "critical" && HOOK_NOTIFICATION_KINDS.has(kind)) {
+    enqueueHookNotification(st, ev);
+  }
+
   for (const waiter of Array.from(st.waiters)) {
     if (ev.seq <= waiter.afterSeq) continue;
     if (!levelMatches(ev.level, waiter.eventsFilter)) continue;
@@ -577,14 +1410,24 @@ function pushEvent(threadId, level, kind, turnId, data) {
       waiter.coalesceTimer = setTimeout(() => resolveWaiter(st, waiter, false), COALESCE_MS);
     }
   }
+
+  if (st.ownerConversationId && (level === "critical" || kind === "turn_started")) {
+    refreshConversationFlags(st.ownerConversationId);
+  }
   return ev;
 }
 
 function prunePendingRequestsForThread(threadId, turnId = null) {
+  let removed = false;
   for (const [reqId, r] of pendingServerRequests.entries()) {
     if (r.threadId !== threadId) continue;
     if (turnId && r.turnId && r.turnId !== turnId) continue;
     pendingServerRequests.delete(reqId);
+    removed = true;
+  }
+  if (removed) {
+    const st = threads.get(threadId);
+    if (st?.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
   }
 }
 
@@ -597,6 +1440,9 @@ function listPendingRequests(threadId = null) {
       method: r.method,
       threadId: r.threadId,
       turnId: r.turnId,
+      ownerGen: r.ownerGen,
+      inboxRead: Boolean(r.inboxRead),
+      submitting: Boolean(r.submitting),
       createdAt: r.createdAt,
       params: r.params,
       preview: r.preview || undefined,
@@ -609,6 +1455,8 @@ function listPendingRequests(threadId = null) {
 function buildCompactSummary(st) {
   return {
     threadId: st.threadId,
+    ownerConversationId: st.ownerConversationId,
+    ownerGen: st.ownerGen,
     name: st.name,
     cwd: st.cwd,
     model: st.model,
@@ -628,6 +1476,8 @@ function buildCompactSummary(st) {
     lastPlan: st.lastPlan,
     lastDiffStats: st.lastDiffStats,
     lastTokenUsage: st.turnTokenUsage || st.lastTokenUsage,
+    unackedNotificationsCount: st.hookNotifications.filter((n) => n.ownerGen === st.ownerGen).length,
+    unreportedOverflowCount: Math.max(0, st.overflowTotal - st.overflowAckedThrough),
     nextCursor: formatCursor(st.nextSeq - 1),
     logPath: st.logPath,
   };
@@ -720,6 +1570,7 @@ function handleServerNotification(msg) {
         st.status = "running";
       }
       appendThreadLog(st, { kind: "server_request_resolved_by_server", reqId: removedEntry.reqId, rpcId: reqRpcId });
+      if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
     }
     return;
   }
@@ -977,8 +1828,9 @@ const SUPERVISOR_DEV_INSTRUCTIONS =
   "This session was started and is actively supervised on the user's behalf by a local coordinator agent (Antigravity), which automatically provides the `message_supervisor` tool. " +
   "Your final answer is always delivered to the supervisor automatically, whereas routine mid-turn commentary is not forwarded. " +
   "Call `message_supervisor` with `wait_for_reply: false` ONLY for major mid-task milestones or risks worth alerting the supervisor while you keep working, " +
-  "and with `wait_for_reply: true` when you are blocked and need a decision, clarification, or confirmation from the supervisor. " +
-  "Do not call it for routine file reads, minor edits, or final completion (just return your final answer normally).";
+  "and with `wait_for_reply: true` when you are blocked and need a decision, clarification, or confirmation from the supervisor — " +
+  "or whenever the supervisor explicitly instructs you in the prompt to call `message_supervisor`. " +
+  "Otherwise do not call it for routine file reads, minor edits, or final completion (just return your final answer normally).";
 
 const SUPERVISOR_DYNAMIC_TOOL = {
   type: "function",
@@ -1086,25 +1938,36 @@ function handleServerRequest(msg) {
 
     // Blocking question: pause Codex tool call until supervisor calls `respond <reqId> --answer "..."`
     const reqId = `${INSTANCE_ID}:${serverReqNextSeq++}`;
-    pendingServerRequests.set(reqId, {
+    const qEntry = {
       reqId,
       rpcId: msg.id,
       method,
       threadId,
       turnId,
+      ownerGen: st.ownerGen,
+      eventSeq: 0,
+      inboxRead: false,
+      submitting: false,
       params: p,
       supervisorMessage: text,
       createdAt: new Date().toISOString(),
-    });
+    };
+    pendingServerRequests.set(reqId, qEntry);
     st.status = "waiting_input";
-    pushEvent(threadId, "critical", "supervisor_question", turnId, {
+    const qEv = pushEvent(threadId, "critical", "supervisor_question", turnId, {
       reqId,
       message: truncateText(text, MAX_INLINE_TEXT),
     });
+    qEntry.eventSeq = qEv.seq;
     return;
   }
 
-  const threadId = p.threadId || p.conversationId || "unknown";
+  // Resolve legacy p.conversationId only to known Codex threads; never treat it as an Antigravity owner
+  let threadId = p.threadId || null;
+  if (!threadId && p.conversationId && (threads.has(p.conversationId) || threadOwners.has(p.conversationId))) {
+    threadId = p.conversationId;
+  }
+  if (!threadId) threadId = p.conversationId || "unknown";
   const turnId = p.turnId || null;
   const reqId = `${INSTANCE_ID}:${serverReqNextSeq++}`;
 
@@ -1122,6 +1985,10 @@ function handleServerRequest(msg) {
     method,
     threadId,
     turnId,
+    ownerGen: st.ownerGen,
+    eventSeq: 0,
+    inboxRead: false,
+    submitting: false,
     params: p,
     preview,
     createdAt: new Date().toISOString(),
@@ -1130,7 +1997,7 @@ function handleServerRequest(msg) {
   st.status = "waiting_input";
 
   const isUserInput = method === "item/tool/requestUserInput";
-  pushEvent(
+  const reqEv = pushEvent(
     threadId,
     "critical",
     isUserInput ? "user_input_request" : "approval_request",
@@ -1147,6 +2014,7 @@ function handleServerRequest(msg) {
       fileChangesPreview: preview,
     }
   );
+  entry.eventSeq = reqEv.seq;
 }
 
 function failAllPendingAndWaiters(reason) {
@@ -1162,6 +2030,8 @@ function failAllPendingAndWaiters(reason) {
       st.activeTurnId = null;
       st.lastError = { message: reason };
       pushEvent(st.threadId, "critical", "daemon_error", st.lastTurnId, st.lastError);
+    } else if (st.ownerConversationId) {
+      refreshConversationFlags(st.ownerConversationId);
     }
   }
 }
@@ -1454,8 +2324,455 @@ function applyCollaborationMode(turnParams, body, st) {
   return mode;
 }
 
+function handleHookPoll(body) {
+  const now = Date.now();
+  pruneExpiredBatchesAndNotifications(now);
+
+  const conversationId = normalizeConversationId(body.conversationId);
+  const hookEventName = typeof body.hookEventName === "string" ? body.hookEventName : "";
+  if (!conversationId || (hookEventName !== "PreInvocation" && hookEventName !== "Stop")) {
+    return { instanceId: INSTANCE_ID, action: "none" };
+  }
+
+  let claimableNotifCount = 0;
+  let overflowTotalUnreported = 0;
+  let unreadPendingCount = 0;
+  let unresolvedPendingCount = 0;
+  let runningUnwaitedCount = 0;
+  const preThreads = new Set();
+  const stopThreads = new Set();
+
+  for (const st of threads.values()) {
+    if (st.ownerConversationId !== conversationId) continue;
+
+    let threadHasPreItem = false;
+    let threadHasStopItem = false;
+
+    for (const n of st.hookNotifications) {
+      if (n.ownerGen !== st.ownerGen) continue;
+      if (n.leaseBatchId && now < n.leaseUntil) continue;
+      if (hasEligibleWaiterForEvent(st, n.seq, "critical")) continue;
+      claimableNotifCount++;
+      threadHasPreItem = true;
+      threadHasStopItem = true;
+    }
+
+    const unreportedOverflow = Math.max(0, st.overflowTotal - st.overflowAckedThrough);
+    if (unreportedOverflow > 0) {
+      // Hook overflows are NOT masked by ordinary /wait (which cannot report Hook overflow)
+      overflowTotalUnreported += unreportedOverflow;
+      threadHasPreItem = true;
+      threadHasStopItem = true;
+    }
+
+    for (const r of pendingServerRequests.values()) {
+      if (r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (hasEligibleWaiterForPending(st, r)) continue;
+      unresolvedPendingCount++;
+      threadHasStopItem = true;
+      if (!r.inboxRead) {
+        unreadPendingCount++;
+        threadHasPreItem = true;
+      }
+    }
+
+    if (st.status === "running" && !hasEligibleWaiterForFuture(st)) {
+      runningUnwaitedCount++;
+    }
+
+    if (threadHasPreItem) preThreads.add(st.threadId);
+    if (threadHasStopItem) stopThreads.add(st.threadId);
+  }
+
+  if (hookEventName === "PreInvocation") {
+    const unreadTotal = claimableNotifCount + overflowTotalUnreported;
+    if (unreadTotal === 0 && unreadPendingCount === 0) {
+      return { instanceId: INSTANCE_ID, action: "none" };
+    }
+    const sig = `${preThreads.size}:${claimableNotifCount}:${overflowTotalUnreported}:${unreadPendingCount}`;
+    const prev = convNudgeState.get(conversationId);
+    if (prev && prev.signature === sig && now - prev.lastNudgeAt < HOOK_NUDGE_COOLDOWN_MS) {
+      return { instanceId: INSTANCE_ID, action: "none", throttled: true };
+    }
+    convNudgeState.set(conversationId, { signature: sig, lastNudgeAt: now });
+    return {
+      instanceId: INSTANCE_ID,
+      action: "inject",
+      threads: preThreads.size,
+      unread: unreadTotal,
+      pending: unreadPendingCount,
+    };
+  }
+
+  // Stop hook (skips PreInvocation 15s cooldown; strict boolean check on continuationActive)
+  if (!NORMAL_STOP_REASONS.has(body.terminationReason) || body.continuationActive !== false) {
+    return { instanceId: INSTANCE_ID, action: "none" };
+  }
+
+  const stopUnreadTotal = claimableNotifCount + overflowTotalUnreported;
+  if (stopUnreadTotal > 0 || unresolvedPendingCount > 0) {
+    return {
+      instanceId: INSTANCE_ID,
+      action: "stop_continue_inbox",
+      threads: stopThreads.size,
+      unread: stopUnreadTotal,
+      pending: unresolvedPendingCount,
+    };
+  }
+
+  if (body.fullyIdle === true && runningUnwaitedCount > 0) {
+    return {
+      instanceId: INSTANCE_ID,
+      action: "stop_continue_wait",
+      running: runningUnwaitedCount,
+    };
+  }
+
+  return { instanceId: INSTANCE_ID, action: "none" };
+}
+
+function buildMinimalPendingSummary(r, st) {
+  return {
+    reqId: r.reqId,
+    threadId: r.threadId,
+    method: r.method,
+    ...(r.params?.tool ? { tool: r.params.tool } : {}),
+    inboxRead: Boolean(r.inboxRead),
+    ...(r.submitting ? { submitting: true } : {}),
+    truncated: true,
+    logPath: st?.logPath || null,
+  };
+}
+
+function handleInboxRead(body) {
+  const now = Date.now();
+  pruneExpiredBatchesAndNotifications(now);
+
+  const reqConvId = parseOptionalConversationId(body.conversationId);
+  const reqThreadId = typeof body.threadId === "string" && body.threadId.trim() ? body.threadId.trim() : null;
+  const maxItems = Math.max(1, Math.min(INBOX_MAX_ITEMS, Number(body.limit || INBOX_MAX_ITEMS)));
+
+  let selectedThreads = [];
+  if (reqThreadId) {
+    const st = threads.get(reqThreadId);
+    if (st) {
+      if (st.ownerConversationId !== null && st.ownerConversationId !== reqConvId) {
+        const err = new Error(
+          reqConvId
+            ? `Thread "${reqThreadId}" is routed to another conversation.`
+            : `Thread "${reqThreadId}" is routed to a specific conversation; ANTIGRAVITY_CONVERSATION_ID is required to read its inbox.`
+        );
+        err.statusCode = 403;
+        throw err;
+      }
+      selectedThreads = [st];
+    }
+  } else if (reqConvId !== null) {
+    selectedThreads = Array.from(threads.values()).filter((st) => st.ownerConversationId === reqConvId);
+  } else {
+    // Missing conversationId: NEVER read or consume threads routed to other conversations (only unowned threads)
+    selectedThreads = Array.from(threads.values()).filter((st) => st.ownerConversationId === null);
+  }
+
+  // Rotate starting index across selected threads so no thread starves under pagination
+  if (selectedThreads.length > 1) {
+    const shift = inboxRotateOffset % selectedThreads.length;
+    selectedThreads = selectedThreads.slice(shift).concat(selectedThreads.slice(0, shift));
+    inboxRotateOffset = (inboxRotateOffset + 1) % 1_000_000;
+  }
+
+  const out = {
+    instanceId: INSTANCE_ID,
+    items: [],
+    pendingRequests: [],
+    overflows: [],
+    inFlightLeasedCount: 0,
+    readPendingTotal: 0,
+    hasMore: false,
+    threadsMeta: {},
+  };
+
+  const candidatesByThread = new Map(); // threadId -> { st, notifIds, pendingReqIds, includeOverflow }
+  const ensureCandidate = (st) => {
+    let c = candidatesByThread.get(st.threadId);
+    if (!c) {
+      c = { st, notifIds: [], pendingReqIds: [], includeOverflow: false };
+      candidatesByThread.set(st.threadId, c);
+    }
+    return c;
+  };
+  const serializedBytes = () => Buffer.byteLength(JSON.stringify(out), "utf8");
+  // Reserve headroom for batchId (~45B) and expiresAt (~25B) so final HTTP JSON is strictly <= INBOX_MAX_BYTES (16 KiB)
+  const BYTE_BUDGET = INBOX_MAX_BYTES - 180;
+
+  // Atomic append helper: enforces BOTH INBOX_MAX_THREADS (across all priorities) AND BYTE_BUDGET,
+  // rolling back payload + threadsMeta together on rejection.
+  const tryCommit = (st, applyFn, rollbackFn, { enforceThreadCap = true } = {}) => {
+    const hadMeta = Object.prototype.hasOwnProperty.call(out.threadsMeta, st.threadId);
+    if (enforceThreadCap && !hadMeta && Object.keys(out.threadsMeta).length >= INBOX_MAX_THREADS) {
+      return false;
+    }
+    if (!hadMeta) {
+      out.threadsMeta[st.threadId] = {
+        status: st.status,
+        nextCursor: formatCursor(st.nextSeq - 1),
+        logPath: st.logPath,
+      };
+    }
+    applyFn();
+    if (serializedBytes() <= BYTE_BUDGET) {
+      return true;
+    }
+    rollbackFn();
+    if (!hadMeta) {
+      delete out.threadsMeta[st.threadId];
+    }
+    return false;
+  };
+
+  // Count in-flight leased notifications & collect pending requests split by unread vs already-read
+  const unreadPendingList = [];
+  const readPendingList = [];
+  for (const st of selectedThreads) {
+    for (const n of st.hookNotifications) {
+      if (n.ownerGen === st.ownerGen && n.leaseBatchId && now < n.leaseUntil) {
+        out.inFlightLeasedCount++;
+      }
+    }
+    for (const r of pendingServerRequests.values()) {
+      if (r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (r.inboxRead) readPendingList.push({ st, r });
+      else unreadPendingList.push({ st, r });
+    }
+  }
+  out.readPendingTotal = readPendingList.length;
+
+  // Priority 1: UNREAD live blocking requests (advances cleanly on ACK because ACK sets inboxRead = true)
+  for (const { st, r } of unreadPendingList) {
+    const fullReq = { threadId: st.threadId, inboxRead: false, ...compactRequest(r) };
+    const addedFull = tryCommit(
+      st,
+      () => out.pendingRequests.push(fullReq),
+      () => out.pendingRequests.pop()
+    );
+    if (addedFull) {
+      ensureCandidate(st).pendingReqIds.push(r.reqId);
+      continue;
+    }
+    const minReq = buildMinimalPendingSummary(r, st);
+    const addedMin = tryCommit(
+      st,
+      () => out.pendingRequests.push(minReq),
+      () => out.pendingRequests.pop()
+    );
+    if (addedMin) {
+      ensureCandidate(st).pendingReqIds.push(r.reqId);
+      continue;
+    }
+    out.hasMore = true;
+    // Do NOT break if rejection was purely INBOX_MAX_THREADS: another unread request on an already-included thread may still fit
+    if (Object.keys(out.threadsMeta).length < INBOX_MAX_THREADS) break;
+  }
+
+  // Priority 2: Unreported overflow watermarks
+  for (const st of selectedThreads) {
+    const unreported = Math.max(0, st.overflowTotal - st.overflowAckedThrough);
+    if (unreported <= 0) continue;
+    const ovObj = { threadId: st.threadId, unreportedCount: unreported, overflowThrough: st.overflowTotal };
+    const added = tryCommit(
+      st,
+      () => out.overflows.push(ovObj),
+      () => out.overflows.pop()
+    );
+    if (added) {
+      ensureCandidate(st).includeOverflow = true;
+    } else {
+      out.hasMore = true;
+      if (Object.keys(out.threadsMeta).length < INBOX_MAX_THREADS) break;
+    }
+  }
+
+  // Priority 3: Claimable non-blocking & terminal notifications (round-robin across threads, bounded by global INBOX_MAX_THREADS & bytes)
+  const queues = [];
+  for (const st of selectedThreads) {
+    const claimable = st.hookNotifications.filter(
+      (n) => n.ownerGen === st.ownerGen && (!n.leaseBatchId || now >= n.leaseUntil)
+    );
+    if (claimable.length > 0) {
+      queues.push({ st, list: claimable, idx: 0 });
+    }
+  }
+
+  let madeProgress = true;
+  while (madeProgress && out.items.length < maxItems) {
+    madeProgress = false;
+    for (const q of queues) {
+      if (out.items.length >= maxItems) break;
+      if (q.idx >= q.list.length) continue;
+      const n = q.list[q.idx];
+      const itemObj = {
+        notifId: n.notifId,
+        threadId: q.st.threadId,
+        seq: n.seq,
+        kind: n.kind,
+        turnId: n.turnId,
+        ...n.data,
+      };
+      const addedFull = tryCommit(
+        q.st,
+        () => out.items.push(itemObj),
+        () => out.items.pop()
+      );
+      if (addedFull) {
+        q.idx++;
+        ensureCandidate(q.st).notifIds.push(n.notifId);
+        madeProgress = true;
+        continue;
+      }
+      if (!Object.prototype.hasOwnProperty.call(out.threadsMeta, q.st.threadId) && Object.keys(out.threadsMeta).length >= INBOX_MAX_THREADS) {
+        out.hasMore = true;
+        continue;
+      }
+      if (out.items.length === 0) {
+        // Single oversized item: try minimal truncated summary and STILL verify BYTE_BUDGET
+        const truncObj = {
+          notifId: n.notifId,
+          threadId: q.st.threadId,
+          seq: n.seq,
+          kind: n.kind,
+          turnId: n.turnId,
+          ...(n.data?.message ? { message: truncateText(n.data.message, 300) } : {}),
+          ...(n.data?.error ? { error: truncateText(n.data.error, 300) } : {}),
+          truncated: true,
+          logPath: q.st.logPath,
+        };
+        const addedTrunc = tryCommit(
+          q.st,
+          () => out.items.push(truncObj),
+          () => out.items.pop()
+        );
+        if (addedTrunc) {
+          q.idx++;
+          ensureCandidate(q.st).notifIds.push(n.notifId);
+          madeProgress = true;
+          continue;
+        }
+      }
+      out.hasMore = true;
+      madeProgress = false;
+      break;
+    }
+  }
+
+  for (const q of queues) {
+    if (q.idx < q.list.length) {
+      out.hasMore = true;
+      break;
+    }
+  }
+
+  // Priority 4: Already-read live blocking requests (respects global INBOX_MAX_THREADS & budget; omits silently using readPendingTotal)
+  for (const { st, r } of readPendingList) {
+    const compactRead =
+      readPendingList.length <= 5
+        ? { threadId: st.threadId, inboxRead: true, ...compactRequest(r) }
+        : buildMinimalPendingSummary(r, st);
+    const added = tryCommit(
+      st,
+      () => out.pendingRequests.push(compactRead),
+      () => out.pendingRequests.pop()
+    );
+    if (!added) {
+      if (!Object.prototype.hasOwnProperty.call(out.threadsMeta, st.threadId) && Object.keys(out.threadsMeta).length >= INBOX_MAX_THREADS) {
+        continue;
+      }
+      const minRead = buildMinimalPendingSummary(r, st);
+      const addedMin = tryCommit(
+        st,
+        () => out.pendingRequests.push(minRead),
+        () => out.pendingRequests.pop()
+      );
+      if (!addedMin) break;
+    }
+  }
+
+  const effectiveConvId = reqConvId;
+  const batch = issueAckBatch(effectiveConvId, Array.from(candidatesByThread.values()), now);
+  if (batch) {
+    out.batchId = batch.batchId;
+    out.expiresAt = batch.expiresAt;
+  }
+
+  return out;
+}
+
+function handleInboxAck(body) {
+  const now = Date.now();
+  pruneExpiredBatchesAndNotifications(now);
+
+  const batchId = typeof body.batchId === "string" ? body.batchId.trim() : "";
+  if (!batchId) {
+    const err = new Error("batchId required");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const reqConvId = parseOptionalConversationId(body.conversationId);
+  const batch = activeBatches.get(batchId);
+  if (!batch) {
+    return { ok: true, applied: 0, expired: true };
+  }
+
+  // Strict full conversation identity check: null matches ONLY null
+  if ((reqConvId ?? null) !== (batch.conversationId ?? null)) {
+    const err = new Error("Conversation mismatch for batchId");
+    err.statusCode = 403;
+    throw err;
+  }
+
+  activeBatches.delete(batchId);
+  let applied = 0;
+  const affectedConvs = new Set();
+
+  for (const entry of batch.entries) {
+    const st = threads.get(entry.threadId);
+    if (!st || st.ownerGen !== entry.ownerGen) continue;
+
+    if (entry.notifIds.length > 0) {
+      const idSet = new Set(entry.notifIds);
+      for (let i = st.hookNotifications.length - 1; i >= 0; i--) {
+        const n = st.hookNotifications[i];
+        // Late B1 ACK never touches B2 because leaseBatchId must match batchId strictly
+        if (n.ownerGen === entry.ownerGen && idSet.has(n.notifId) && n.leaseBatchId === batchId) {
+          st.hookNotifications.splice(i, 1);
+          applied++;
+        }
+      }
+    }
+
+    if (entry.overflowThrough > 0 && entry.overflowThrough > st.overflowAckedThrough) {
+      st.overflowAckedThrough = Math.max(st.overflowAckedThrough, entry.overflowThrough);
+      applied++;
+    }
+
+    for (const reqId of entry.pendingReqIds) {
+      const r = pendingServerRequests.get(reqId);
+      if (r && r.threadId === entry.threadId && r.ownerGen === entry.ownerGen) {
+        if (!r.inboxRead) {
+          r.inboxRead = true;
+          applied++;
+        }
+      }
+    }
+
+    if (st.ownerConversationId) affectedConvs.add(st.ownerConversationId);
+  }
+
+  for (const c of affectedConvs) refreshConversationFlags(c);
+  return { ok: true, applied, expired: false };
+}
+
 async function handleApi(req, res) {
-  lastActivityMs = Date.now();
   const url = new URL(req.url, "http://127.0.0.1");
 
   if (url.pathname === "/health" && req.method === "GET") {
@@ -1463,6 +2780,8 @@ async function handleApi(req, res) {
       ok: codexReady,
       pid: process.pid,
       instanceId: INSTANCE_ID,
+      protocolVersion: PROTOCOL_VERSION,
+      capabilities: { hookPoll: true, inbox: true },
       codexBin,
       codexInitInfo,
       activeThreads: Array.from(threads.values()).filter((t) => t.status === "running" || t.status === "waiting_input").length,
@@ -1471,11 +2790,45 @@ async function handleApi(req, res) {
   }
 
   const auth = req.headers.authorization || "";
+
+  // Dedicated least-privilege Hook route: accepts ONLY hookToken; empty probes do NOT extend idle TTL
+  if (url.pathname === "/hook/poll" && req.method === "POST") {
+    if (auth !== `Bearer ${hookToken}`) {
+      return jsonResponse(res, 401, { error: "Unauthorized" });
+    }
+    try {
+      const body = await readJsonBody(req);
+      const result = handleHookPoll(body);
+      if (result.action !== "none") {
+        lastActivityMs = Date.now();
+      }
+      return jsonResponse(res, 200, result);
+    } catch (err) {
+      const code = err.statusCode || 500;
+      logDaemon(`Hook poll error (${code}): ${err.message}`);
+      if (!res.writableEnded && !res.destroyed) {
+        return jsonResponse(res, code, { error: err.message || String(err) });
+      }
+      return;
+    }
+  }
+
   if (auth !== `Bearer ${authToken}`) {
     return jsonResponse(res, 401, { error: "Unauthorized" });
   }
 
+  lastActivityMs = Date.now();
+
   try {
+    if (url.pathname === "/inbox" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      return jsonResponse(res, 200, handleInboxRead(body));
+    }
+
+    if (url.pathname === "/inbox/ack" && req.method === "POST") {
+      const body = await readJsonBody(req);
+      return jsonResponse(res, 200, handleInboxAck(body));
+    }
     if (url.pathname === "/models" && req.method === "GET") {
       const limit = Number(url.searchParams.get("limit") || 30);
       const data = await rpcCall("model/list", { limit });
@@ -1525,6 +2878,8 @@ async function handleApi(req, res) {
 
       const result = await withThreadLock(threadId, async () => {
         const st = getThreadState(threadId);
+        // Bind notification routing synchronously BEFORE turn/start RPC
+        bindNewThreadOwner(st, body.ownerConversationId);
         st.cwd = thRes.cwd || thRes.thread?.cwd || body.cwd || null;
         st.model = thRes.model || body.model || null;
         st.sandbox = normalizeSandboxPolicy(thRes.sandbox) || body.sandbox || null;
@@ -1562,6 +2917,7 @@ async function handleApi(req, res) {
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
           markTurnStartedIfNotFinished(st, turnId);
+          if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
             action: "start",
@@ -1588,7 +2944,11 @@ async function handleApi(req, res) {
     if (url.pathname === "/resume" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      if (body.claimOwner && body.prompt) {
+        return jsonResponse(res, 400, { error: "resume --claim cannot be combined with --prompt; claim first, then call send" });
+      }
       const reqMode = validateMode(body.mode);
+      const reqConvId = normalizeConversationId(body.ownerConversationId);
 
       const out = await withThreadLock(body.threadId, async () => {
         const params = { threadId: body.threadId, excludeTurns: true };
@@ -1627,6 +2987,68 @@ async function handleApi(req, res) {
           throw err;
         }
 
+        // Synchronous ownership claim/transfer critical section (NO await between checks and commit)
+        pruneExpiredBatchesAndNotifications();
+        if (reqConvId) {
+          if (!st.ownerConversationId) {
+            if (
+              st.status !== "running" &&
+              st.waiters.size === 0 &&
+              !hasActiveBatchForThread(st.threadId)
+            ) {
+              st.ownerConversationId = reqConvId;
+              st.ownerGen = nextOwnerGen++;
+              setThreadOwnerRecord(st.threadId, st.ownerConversationId, st.ownerGen);
+              // Atomically migrate any live unowned requests/notifications to the new ownerGen
+              for (const r of pendingServerRequests.values()) {
+                if (r.threadId === st.threadId) {
+                  r.ownerGen = st.ownerGen;
+                  r.inboxRead = false;
+                }
+              }
+              for (const n of st.hookNotifications) {
+                n.ownerGen = st.ownerGen;
+                n.leaseBatchId = null;
+                n.leaseUntil = 0;
+              }
+              refreshConversationFlags(st.ownerConversationId);
+            } else if (body.claimOwner) {
+              const err = new Error("Cannot claim unowned thread while it has an active turn, waiter, or in-flight batch.");
+              err.statusCode = 409;
+              throw err;
+            }
+          } else if (st.ownerConversationId !== reqConvId && body.claimOwner) {
+            const reasons = [];
+            if (st.activeTurnId || st.status === "running" || st.status === "waiting_input") {
+              reasons.push(`status=${st.status}`);
+            }
+            if (listPendingRequests(st.threadId).length > 0) reasons.push("pending_requests");
+            if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen)) reasons.push("unacked_notifications");
+            if (st.overflowTotal > st.overflowAckedThrough) reasons.push("unreported_overflow");
+            if (hasActiveBatchForThread(st.threadId)) reasons.push("active_batch");
+            if (Array.from(st.waiters).some((w) => isEligibleWaiterBase(st, w))) reasons.push("active_owner_waiter");
+            if (reasons.length > 0) {
+              const err = new Error(`Cannot claim owned thread until it is clean (${reasons.join(", ")}).`);
+              err.statusCode = 409;
+              throw err;
+            }
+            const oldOwner = st.ownerConversationId;
+            st.ownerConversationId = reqConvId;
+            st.ownerGen = nextOwnerGen++;
+            st.hookNotifications = [];
+            st.overflowTotal = 0;
+            st.overflowAckedThrough = 0;
+            st.overflowUpdatedAtMs = 0;
+            setThreadOwnerRecord(st.threadId, st.ownerConversationId, st.ownerGen);
+            refreshConversationFlags(oldOwner);
+            refreshConversationFlags(st.ownerConversationId);
+          }
+        } else if (body.claimOwner) {
+          const err = new Error("resume --claim requires ANTIGRAVITY_CONVERSATION_ID (ownerConversationId).");
+          err.statusCode = 400;
+          throw err;
+        }
+
         appendThreadLog(st, {
           kind: "thread_meta",
           action: "resume",
@@ -1647,6 +3069,7 @@ async function handleApi(req, res) {
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
           markTurnStartedIfNotFinished(st, turnId);
+          if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
             action: "resume",
@@ -1664,6 +3087,7 @@ async function handleApi(req, res) {
           turnId,
           cursor: formatCursor(cursorBefore),
           status: st.status,
+          ownerConversationId: st.ownerConversationId,
           effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model },
           logPath: st.logPath,
         };
@@ -1708,6 +3132,8 @@ async function handleApi(req, res) {
 
       const out = await withThreadLock(newThreadId, async () => {
         const st = getThreadState(newThreadId);
+        // Bind routing ONLY on the new forked thread (source thread stays untouched)
+        bindNewThreadOwner(st, body.ownerConversationId);
         st.cwd = effCwd || st.cwd;
         st.model = resData.model || st.model;
         st.sandbox = effSandbox || st.sandbox;
@@ -1742,6 +3168,7 @@ async function handleApi(req, res) {
             const tRes = await rpcCall("turn/start", turnParams);
             turnId = tRes.turn?.id || tRes.turnId || null;
             markTurnStartedIfNotFinished(st, turnId);
+            if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fork",
@@ -1793,6 +3220,7 @@ async function handleApi(req, res) {
         const tRes = await rpcCall("turn/start", turnParams);
         const turnId = tRes.turn?.id || tRes.turnId || null;
         markTurnStartedIfNotFinished(st, turnId);
+        if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
         appendThreadLog(st, {
           kind: "supervisor_prompt",
           action: "send",
@@ -1838,6 +3266,7 @@ async function handleApi(req, res) {
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
             markTurnStartedIfNotFinished(st, turnId);
+            if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
@@ -1885,6 +3314,7 @@ async function handleApi(req, res) {
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
             markTurnStartedIfNotFinished(st, turnId);
+            if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
@@ -1943,11 +3373,15 @@ async function handleApi(req, res) {
 
       const result = buildServerRequestResponse(entry, body);
       entry.submitting = true;
+      const stBefore = threads.get(entry.threadId);
+      if (stBefore?.ownerConversationId) refreshConversationFlags(stBefore.ownerConversationId);
       try {
         await sendJsonRpcAsync({ jsonrpc: "2.0", id: entry.rpcId, result });
       } catch (err) {
         if (pendingServerRequests.get(reqId) === entry) {
           entry.submitting = false;
+          const stRollback = threads.get(entry.threadId);
+          if (stRollback?.ownerConversationId) refreshConversationFlags(stRollback.ownerConversationId);
         }
         throw err;
       }
@@ -1958,6 +3392,7 @@ async function handleApi(req, res) {
         st.status = "running";
       }
       appendThreadLog(st, { kind: "server_request_responded", reqId, method: entry.method, result });
+      if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
       return jsonResponse(res, 200, {
         ok: true,
         submitted: true,
@@ -1971,16 +3406,28 @@ async function handleApi(req, res) {
     if (url.pathname === "/wait" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      pruneExpiredBatchesAndNotifications();
       const st = getThreadState(body.threadId);
       const { seq: afterSeq, provided: afterProvided, instanceMismatch } = parseCursor(body.after);
       const timeoutSec = Math.max(1, Math.min(1800, Number(body.timeout ?? 600)));
       const eventsFilter = body.events || "critical";
+      const callerConversationId = normalizeConversationId(body.ownerConversationId);
+      const supportsAckBatch = Boolean(body.supportsAckBatch);
+      const callerOwnerGen = st.ownerGen;
+      const ackCtx = { supportsAckBatch, ownerConversationId: callerConversationId, ownerGen: callerOwnerGen };
       const gap = detectCursorGap(st, afterSeq, afterProvided, instanceMismatch);
+
+      const respondWaitSync = (opts) => {
+        const rendered = { notifSeqs: new Set(), reqIds: new Set() };
+        const payload = buildWaitPayload(st, { ...opts, rendered });
+        attachWaitAckBatch(st, payload, rendered, ackCtx);
+        return jsonResponse(res, 200, payload);
+      };
 
       // If daemon restarted or buffer truncated, wake immediately so supervisor can resync
       if (gap.cursorGap) {
         const existingAll = st.events.filter((e) => levelMatches(e.level, eventsFilter));
-        return jsonResponse(res, 200, buildWaitPayload(st, { timedOut: false, matched: existingAll.slice(-5), gap, eventsFilter }));
+        return respondWaitSync({ timedOut: false, matched: existingAll.slice(-5), gap, eventsFilter });
       }
 
       const existing = st.events.filter((e) => e.seq > afterSeq && levelMatches(e.level, eventsFilter));
@@ -1988,15 +3435,15 @@ async function handleApi(req, res) {
       const pend = listPendingRequests(st.threadId);
 
       if (hasCriticalExisting || pend.length > 0) {
-        return jsonResponse(res, 200, buildWaitPayload(st, { timedOut: false, matched: existing, gap, eventsFilter }));
+        return respondWaitSync({ timedOut: false, matched: existing, gap, eventsFilter });
       }
 
       if (existing.length > 0 && !st.activeTurnId) {
-        return jsonResponse(res, 200, buildWaitPayload(st, { timedOut: false, matched: existing, gap, eventsFilter }));
+        return respondWaitSync({ timedOut: false, matched: existing, gap, eventsFilter });
       }
 
       if (!st.activeTurnId && !body.forceWait && existing.length === 0) {
-        return jsonResponse(res, 200, buildWaitPayload(st, { timedOut: false, matched: [], gap, eventsFilter }));
+        return respondWaitSync({ timedOut: false, matched: [], gap, eventsFilter });
       }
 
       if (res.destroyed || res.writableEnded) return;
@@ -2007,6 +3454,9 @@ async function handleApi(req, res) {
           afterProvided,
           instanceMismatch,
           eventsFilter,
+          ownerConversationId: callerConversationId,
+          ownerGen: callerOwnerGen,
+          supportsAckBatch,
           resolve,
           res,
           timer: null,
@@ -2030,6 +3480,7 @@ async function handleApi(req, res) {
         }
 
         st.waiters.add(waiter);
+        if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
       });
 
       if (payload && !res.writableEnded && !res.destroyed) {
@@ -2132,25 +3583,68 @@ function killCodexTree() {
   }
 }
 
+function writeJsonAtomic(filePath, obj) {
+  const tmpFile = `${filePath}.${process.pid}.${crypto.randomBytes(6).toString("hex")}.tmp`;
+  const fd = fs.openSync(tmpFile, "wx", 0o600);
+  let closed = false;
+  try {
+    fs.writeFileSync(fd, JSON.stringify(obj, null, 2), "utf8");
+    fs.closeSync(fd);
+    closed = true;
+    if (process.platform !== "win32") {
+      fs.chmodSync(tmpFile, 0o600);
+    }
+    fs.renameSync(tmpFile, filePath);
+  } catch (err) {
+    if (!closed) {
+      try {
+        fs.closeSync(fd);
+      } catch {}
+    }
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {}
+    throw err;
+  }
+}
+
+function unlinkOwnedStateFile(filePath) {
+  try {
+    if (fs.existsSync(filePath)) {
+      const st = JSON.parse(fs.readFileSync(filePath, "utf8"));
+      if (st.instanceId === INSTANCE_ID || (!st.instanceId && st.pid === process.pid)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  } catch {}
+}
+
 function cleanupAndExit(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  unlinkOwnedStateFile(STATE_FILE);
+  unlinkOwnedStateFile(HOOK_STATE_FILE);
   try {
-    if (fs.existsSync(STATE_FILE)) {
-      const st = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-      if (st.pid === process.pid) fs.unlinkSync(STATE_FILE);
-    }
+    fs.rmSync(INSTANCE_HOOKS_DIR, { recursive: true, force: true });
   } catch {}
   try {
     server.close();
   } catch {}
   // Terminate child process BEFORE releasing startup lock
   killCodexTree();
+  if (winMutexServer) {
+    try {
+      winMutexServer.close();
+    } catch {}
+    winMutexServer = null;
+  }
   if (ownsLock) {
     try {
       if (fs.existsSync(LOCK_FILE)) {
         const info = JSON.parse(fs.readFileSync(LOCK_FILE, "utf8"));
-        if (info.pid === process.pid) fs.unlinkSync(LOCK_FILE);
+        if (info.instanceId === INSTANCE_ID || (!info.instanceId && info.pid === process.pid)) {
+          fs.unlinkSync(LOCK_FILE);
+        }
       }
     } catch {}
   }
@@ -2160,13 +3654,40 @@ function cleanupAndExit(code = 0) {
 process.on("SIGINT", () => cleanupAndExit(0));
 process.on("SIGTERM", () => cleanupAndExit(0));
 
+// Independent backoff retry for failed flag writes (recovers even when no new Codex events arrive)
+setInterval(() => {
+  if (shuttingDown || flagDirty.size === 0) return;
+  for (const convId of Array.from(flagDirty)) {
+    refreshConversationFlags(convId, true);
+  }
+}, FLAG_RETRY_MS).unref();
+
+// Independent expired batch/notification TTL sweeper (runs even when IDLE_TIMEOUT_MS === 0)
+setInterval(() => {
+  if (shuttingDown) return;
+  pruneExpiredBatchesAndNotifications();
+}, Math.min(IDLE_SWEEP_MS, 30_000)).unref();
+
 if (IDLE_TIMEOUT_MS > 0) {
   setInterval(() => {
     const now = Date.now();
-    // Evict long-idle threads from memory to keep daemon footprint bounded
+    pruneExpiredBatchesAndNotifications(now);
+    // Evict long-idle threads from memory while preserving lightweight threadOwners & nextSeq
     for (const [tid, st] of threads.entries()) {
       const hasPending = listPendingRequests(tid).length > 0;
-      if (st.status !== "running" && st.status !== "waiting_input" && st.waiters.size === 0 && !hasPending && now - st.updatedAt > IDLE_TIMEOUT_MS) {
+      const locked = threadLocks.has(tid);
+      const batched = hasActiveBatchForThread(tid, now);
+      const hasUnread = hasUnexpiredNotificationOrOverflow(st, now);
+      if (
+        !locked &&
+        !batched &&
+        !hasPending &&
+        !hasUnread &&
+        st.status !== "running" &&
+        st.status !== "waiting_input" &&
+        st.waiters.size === 0 &&
+        now - st.updatedAt > IDLE_TIMEOUT_MS
+      ) {
         evictedThreadSeq.set(tid, st.nextSeq);
         if (evictedThreadSeq.size > 500) {
           const oldest = evictedThreadSeq.keys().next().value;
@@ -2177,29 +3698,52 @@ if (IDLE_TIMEOUT_MS > 0) {
     }
     const busy =
       pendingServerRequests.size > 0 ||
-      Array.from(threads.values()).some((t) => t.status === "running" || t.status === "waiting_input" || t.waiters.size > 0);
+      activeBatches.size > 0 ||
+      threadLocks.size > 0 ||
+      Array.from(threads.values()).some(
+        (t) =>
+          t.status === "running" ||
+          t.status === "waiting_input" ||
+          t.waiters.size > 0 ||
+          hasUnexpiredNotificationOrOverflow(t, now)
+      );
     if (!busy && now - lastActivityMs > IDLE_TIMEOUT_MS) {
       logDaemon("Idle timeout reached; shutting down daemon cleanly.");
       cleanupAndExit(0);
     }
-  }, 60_000).unref();
+  }, IDLE_SWEEP_MS).unref();
 }
 
 await startCodexProcess();
 
 server.listen(0, "127.0.0.1", () => {
   const { port } = server.address();
+  const startedAt = new Date().toISOString();
   const state = {
     pid: process.pid,
     instanceId: INSTANCE_ID,
+    protocolVersion: PROTOCOL_VERSION,
     port,
     token: authToken,
     codexBin,
-    startedAt: new Date().toISOString(),
+    startedAt,
   };
-  const tmpFile = `${STATE_FILE}.${process.pid}.tmp`;
-  fs.writeFileSync(tmpFile, JSON.stringify(state, null, 2), { encoding: "utf8", mode: 0o600 });
-  fs.renameSync(tmpFile, STATE_FILE);
+  const hookState = {
+    pid: process.pid,
+    instanceId: INSTANCE_ID,
+    protocolVersion: PROTOCOL_VERSION,
+    port,
+    hookToken,
+    startedAt,
+  };
+  try {
+    writeJsonAtomic(STATE_FILE, state);
+    writeJsonAtomic(HOOK_STATE_FILE, hookState);
+  } catch (err) {
+    logDaemon(`Failed to publish discovery files: ${err.message}`);
+    cleanupAndExit(1);
+    return;
+  }
   logDaemon(`Bridge daemon listening on http://127.0.0.1:${port} (pid=${process.pid}, instanceId=${INSTANCE_ID})`);
-  console.log(JSON.stringify({ ready: true, pid: process.pid, instanceId: INSTANCE_ID, port }));
+  console.log(JSON.stringify({ ready: true, pid: process.pid, instanceId: INSTANCE_ID, port, protocolVersion: PROTOCOL_VERSION }));
 });

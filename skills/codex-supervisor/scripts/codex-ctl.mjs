@@ -17,21 +17,26 @@ const DAEMON_SCRIPT = path.join(__dirname, "bridge-daemon.mjs");
 const STATE_DIR = process.env.CODEX_BRIDGE_STATE_DIR || path.join(os.homedir(), ".gemini", "cache", "codex-supervisor");
 const STATE_FILE = path.join(STATE_DIR, "daemon.json");
 const MAX_STDIN_BYTES = 5 * 1024 * 1024;
+const OWNER_CONV_ID =
+  typeof process.env.ANTIGRAVITY_CONVERSATION_ID === "string" && process.env.ANTIGRAVITY_CONVERSATION_ID.trim()
+    ? process.env.ANTIGRAVITY_CONVERSATION_ID.trim()
+    : null;
 
-const BOOL_FLAGS = new Set(["ephemeral", "stdin", "fallback-send", "force", "help"]);
+const BOOL_FLAGS = new Set(["ephemeral", "stdin", "fallback-send", "force", "help", "claim", "no-ack"]);
 
 const ALLOWED_FLAGS = {
   health: new Set([]),
   models: new Set(["limit"]),
   threads: new Set(["limit", "cwd"]),
   start: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
-  resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "prompt", "prompt-file", "stdin"]),
+  resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "claim", "prompt", "prompt-file", "stdin"]),
   fork: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
   send: new Set(["cwd", "model", "approval", "effort", "mode", "prompt", "prompt-file", "stdin"]),
   steer: new Set(["turn-id", "fallback-send", "prompt", "prompt-file", "stdin"]),
   interrupt: new Set(["turn-id"]),
   respond: new Set(["decision", "scope", "reason", "permissions", "answer", "answers"]),
-  wait: new Set(["after", "timeout", "events", "force"]),
+  wait: new Set(["after", "timeout", "events", "force", "no-ack"]),
+  inbox: new Set(["limit", "no-ack"]),
   status: new Set([]),
   history: new Set(["limit"]),
   stop: new Set([]),
@@ -190,12 +195,14 @@ function httpRequestJson(port, method, route, { headers = {}, body = undefined, 
         res.on("end", () => {
           const text = Buffer.concat(chunks).toString("utf8");
           let data;
+          let jsonValid = false;
           try {
             data = JSON.parse(text);
+            jsonValid = Boolean(data && typeof data === "object" && !Array.isArray(data));
           } catch {
             data = { raw: text };
           }
-          finishOk({ status: res.statusCode || 0, ok: res.statusCode >= 200 && res.statusCode < 300, data, text });
+          finishOk({ status: res.statusCode || 0, ok: res.statusCode >= 200 && res.statusCode < 300, jsonValid, data, text });
         });
       }
     );
@@ -205,13 +212,74 @@ function httpRequestJson(port, method, route, { headers = {}, body = undefined, 
   });
 }
 
-async function checkHealth(state) {
-  if (!state || !state.port) return false;
+function isPidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return Boolean(e && e.code === "EPERM");
+  }
+}
+
+async function fetchHealth(state) {
+  if (!state || !state.port) return null;
+  if (state.pid !== undefined && !isPidAlive(state.pid)) return null;
   try {
     const res = await httpRequestJson(state.port, "GET", "/health", { timeoutMs: 1500 });
-    return res.ok && Boolean(res.data?.ok);
+    if (res.ok && res.jsonValid) return res.data;
+    return null;
   } catch {
-    return false;
+    return null;
+  }
+}
+
+async function checkHealth(state) {
+  const h = await fetchHealth(state);
+  return Boolean(h && h.ok);
+}
+
+let lastStdoutError = null;
+process.stdout.on("error", (err) => {
+  lastStdoutError = err;
+});
+
+function writeStdoutComplete(text) {
+  return new Promise((resolve, reject) => {
+    if (lastStdoutError || process.stdout.destroyed || !process.stdout.writable) {
+      return reject(lastStdoutError || new Error("stdout is not writable"));
+    }
+    let settled = false;
+    const onErr = (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    };
+    process.stdout.once("error", onErr);
+    process.stdout.write(text, "utf8", (err) => {
+      if (settled) return;
+      settled = true;
+      if (err) {
+        // Keep the module-level stdout error listener active so Node's post-callback 'error' event never crashes as unhandled
+        reject(err);
+      } else {
+        process.stdout.off("error", onErr);
+        resolve();
+      }
+    });
+  });
+}
+
+async function sendBestEffortAck(state, batchId, conversationId) {
+  if (!batchId) return;
+  try {
+    await httpRequestJson(state.port, "POST", "/inbox/ack", {
+      headers: { Authorization: `Bearer ${state.token}` },
+      body: { batchId, conversationId: conversationId || null },
+      timeoutMs: 1000,
+    });
+  } catch {
+    // Best-effort: preserve already-printed output; lease expiry guarantees retry
   }
 }
 
@@ -219,24 +287,80 @@ async function ensureDaemon() {
   let state = readState();
   if (await checkHealth(state)) return state;
 
-  fs.mkdirSync(STATE_DIR, { recursive: true });
+  // Do NOT pre-create STATE_DIR here: let bridge-daemon.mjs validate ancestor/reparse safety before mkdirSync!
   // Never delete daemon.json from CLI (avoids racing with another client's fresh daemon).
-  // The lock-owning daemon atomically replaces daemon.json once ready.
+  // Capture early stderr/exit diagnostics so startup failures (e.g. ReparsePoint or ConstrainedLanguage) surface immediately.
   const child = spawn(process.execPath, [DAEMON_SCRIPT], {
     detached: true,
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "pipe"],
     windowsHide: true,
     env: process.env,
   });
-  child.unref();
+
+  let diagErr = "";
+  let diagOut = "";
+  let closed = false;
+  let exitCode = null;
+  let spawnErr = null;
+  const appendCap = (cur, chunk) => (cur.length >= 4096 ? cur : (cur + chunk.toString("utf8")).slice(0, 4096));
+  child.stderr?.on("data", (c) => {
+    diagErr = appendCap(diagErr, c);
+  });
+  child.stdout?.on("data", (c) => {
+    diagOut = appendCap(diagOut, c);
+  });
+  child.once("error", (err) => {
+    spawnErr = err;
+    closed = true;
+  });
+  // Wait for `close` (NOT `exit`) so stdout/stderr pipes are completely drained before inspecting diagnostics
+  child.once("close", (code) => {
+    closed = true;
+    exitCode = code;
+  });
+
+  const detachChild = () => {
+    try {
+      child.stdout?.destroy();
+      child.stderr?.destroy();
+    } catch {}
+    try {
+      child.unref();
+    } catch {}
+  };
 
   const deadline = Date.now() + 12_000;
   while (Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 150));
     state = readState();
-    if (await checkHealth(state)) return state;
+    if (await checkHealth(state)) {
+      detachChild();
+      return state;
+    }
+    if (closed) {
+      if (spawnErr) {
+        throw new Error(`Failed to spawn Codex bridge daemon: ${spawnErr.message}`);
+      }
+      // If child exited 0 with {"alreadyRunning":true}, give the winning daemon a moment to publish daemon.json
+      let alreadyRunning = false;
+      try {
+        const firstLine = diagOut.trim().split(/\r?\n/)[0] || "";
+        alreadyRunning = Boolean(firstLine && JSON.parse(firstLine)?.alreadyRunning === true);
+      } catch {}
+      if (exitCode === 0 && alreadyRunning) {
+        continue;
+      }
+      const detail = (diagErr || diagOut).trim();
+      throw new Error(
+        `Codex bridge daemon exited early (code=${exitCode})${detail ? `: ${detail}` : `. Check ${path.join(STATE_DIR, "daemon.log")}`}`
+      );
+    }
   }
-  throw new Error(`Codex bridge daemon failed to start within 12s. Check ${path.join(STATE_DIR, "daemon.log")}`);
+  detachChild();
+  const detail = (diagErr || diagOut).trim();
+  throw new Error(
+    `Codex bridge daemon failed to start within 12s${detail ? `: ${detail}` : `. Check ${path.join(STATE_DIR, "daemon.log")}`}`
+  );
 }
 
 async function api(state, method, route, body = undefined, timeoutMs = 1860_000) {
@@ -252,6 +376,22 @@ async function api(state, method, route, body = undefined, timeoutMs = 1860_000)
   return res.data;
 }
 
+async function apiStrict(state, method, route, body = undefined, timeoutMs = 1860_000) {
+  const res = await httpRequestJson(state.port, method, route, {
+    headers: { Authorization: `Bearer ${state.token}` },
+    body,
+    timeoutMs,
+  });
+  if (!res.ok) {
+    const msg = res.data?.error || res.text || `HTTP ${res.status}`;
+    throw new Error(msg);
+  }
+  if (!res.jsonValid) {
+    throw new Error(`Invalid JSON response from ${method} ${route}`);
+  }
+  return res.data;
+}
+
 function usage() {
   console.log(`Usage: node codex-ctl.mjs <command> [args] [options]
 
@@ -262,14 +402,16 @@ Commands:
   start [--cwd DIR] [--model M] [--sandbox danger-full-access|workspace-write|read-only]
         [--approval never|on-request|untrusted] [--effort low|medium|high|xhigh]
         [--mode plan|default] [--name TITLE] [--ephemeral] [--prompt TEXT | --prompt-file FILE | --stdin]
-  resume <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--mode plan|default] [--prompt ...]
+  resume <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--mode plan|default] [--claim] [--prompt ...]
   fork <threadId> [--cwd DIR] [--model M] [--sandbox ...] [--approval ...] [--mode plan|default] [--name TITLE] [--ephemeral] [--prompt ...]
   send <threadId> [--model M] [--effort ...] [--mode plan|default] (--prompt TEXT | --prompt-file FILE | --stdin)
   steer <threadId> [--turn-id ID] [--fallback-send] (--prompt TEXT | --prompt-file FILE | --stdin)
   interrupt <threadId> [--turn-id ID]     Request interruption of active turn
   respond <reqId> --decision accept|acceptForSession|decline|cancel [--scope turn|session]
           [--reason TEXT] [--permissions JSON] | --answer TEXT | --answers JSON
-  wait <threadId> [--after CURSOR] [--timeout SEC] [--events critical|milestone|all] [--force]
+  wait <threadId> [--after CURSOR] [--timeout SEC] [--events critical|milestone|all] [--force] [--no-ack]
+  inbox [threadId] [--limit N] [--no-ack] Read unread Codex notifications & live blocking requests for this conversation
+  inbox ack <batchId>                     Explicitly acknowledge a leased inbox/wait batch
   status [threadId]                       Snapshot active thread(s) without blocking
   history <threadId> [--limit N]          Read compact recent turns from Codex thread
   stop                                    Stop local bridge daemon`);
@@ -295,8 +437,11 @@ async function main() {
   if (flags.mode !== undefined && flags.mode !== "plan" && flags.mode !== "default") {
     throw new Error(`Invalid --mode "${flags.mode}" (expected "plan" or "default")`);
   }
-  if (cmd === "models" || cmd === "threads" || cmd === "history") {
+  if (cmd === "models" || cmd === "threads" || cmd === "history" || cmd === "inbox") {
     limit = parseIntFlag("limit", flags.limit, 1, 200);
+  }
+  if (cmd === "inbox" && positional[1] === "ack") {
+    if (!positional[2]) throw new Error("inbox ack requires <batchId>");
   }
   if (cmd === "wait") {
     if (!positional[1]) throw new Error("wait requires <threadId>");
@@ -307,6 +452,9 @@ async function main() {
   }
   if (cmd === "start" || cmd === "resume" || cmd === "fork" || cmd === "send" || cmd === "steer") {
     prompt = await resolvePrompt(flags);
+    if (cmd === "resume" && flags.claim && prompt) {
+      throw new Error("resume --claim cannot be combined with --prompt/--prompt-file/--stdin");
+    }
     if ((cmd === "send" || cmd === "steer") && (!positional[1] || !prompt)) {
       throw new Error(`${cmd} requires <threadId> and --prompt/--prompt-file/--stdin`);
     }
@@ -332,12 +480,66 @@ async function main() {
 
   if (cmd === "stop") {
     const state = readState();
-    if (!(await checkHealth(state))) {
+    const health = await fetchHealth(state);
+    if (!health) {
       console.log(JSON.stringify({ stopped: true, wasRunning: false }));
       return;
     }
     const r = await api(state, "POST", "/stop");
     console.log(JSON.stringify(r, null, 2));
+    return;
+  }
+
+  if (cmd === "inbox") {
+    // Prefer reading any live published daemon without spawning a fresh app-server
+    const state = readState();
+    const health = await fetchHealth(state);
+    if (!health) {
+      if (positional[1] === "ack") {
+        throw new Error("Bridge daemon is not running");
+      }
+      await writeStdoutComplete(JSON.stringify({ daemonRunning: false, items: [], pendingRequests: [], overflows: [] }, null, 2) + "\n");
+      return;
+    }
+    if (!health.capabilities?.inbox) {
+      if (positional[1] === "ack") {
+        throw new Error("Running bridge daemon does not support inbox/ack (upgrade by running `codex-ctl.mjs stop` after current tasks finish).");
+      }
+      await writeStdoutComplete(
+        JSON.stringify(
+          {
+            daemonRunning: true,
+            upgradeRequired: true,
+            message: "Running bridge daemon predates inbox/hook support. Finish active tasks and run `codex-ctl.mjs stop` to restart with the upgraded daemon.",
+            items: [],
+            pendingRequests: [],
+            overflows: [],
+          },
+          null,
+          2
+        ) + "\n"
+      );
+      return;
+    }
+
+    if (positional[1] === "ack") {
+      const ackRes = await apiStrict(state, "POST", "/inbox/ack", {
+        batchId: positional[2],
+        conversationId: OWNER_CONV_ID,
+      }, 5000);
+      await writeStdoutComplete(JSON.stringify(ackRes, null, 2) + "\n");
+      return;
+    }
+
+    const body = { conversationId: OWNER_CONV_ID };
+    if (positional[1]) body.threadId = positional[1];
+    if (limit) body.limit = limit;
+    const data = await apiStrict(state, "POST", "/inbox", body, 10_000);
+    // Compact JSON keeps CLI stdout strictly aligned with the daemon's 16 KiB UTF-8 payload budget
+    await writeStdoutComplete(JSON.stringify(data) + "\n");
+    if (!flags["no-ack"] && data.batchId) {
+      await sendBestEffortAck(state, data.batchId, OWNER_CONV_ID);
+    }
     return;
   }
 
@@ -366,6 +568,7 @@ async function main() {
 
   if (cmd === "start") {
     const r = await api(state, "POST", "/start", {
+      ownerConversationId: OWNER_CONV_ID,
       cwd: flags.cwd || process.cwd(),
       model: flags.model,
       sandbox: flags.sandbox || "workspace-write",
@@ -381,7 +584,18 @@ async function main() {
   }
 
   if (cmd === "resume") {
-    const r = await api(state, "POST", "/resume", {
+    if (flags.claim) {
+      const health = await fetchHealth(state);
+      if (!health?.capabilities?.inbox) {
+        throw new Error("Running bridge daemon does not support `resume --claim`. Finish active tasks and run `codex-ctl.mjs stop` to upgrade.");
+      }
+      if (!OWNER_CONV_ID) {
+        throw new Error("resume --claim requires ANTIGRAVITY_CONVERSATION_ID.");
+      }
+    }
+    const r = await apiStrict(state, "POST", "/resume", {
+      ownerConversationId: OWNER_CONV_ID,
+      claimOwner: Boolean(flags.claim),
       threadId: positional[1],
       cwd: flags.cwd,
       model: flags.model,
@@ -391,12 +605,16 @@ async function main() {
       mode: flags.mode,
       prompt,
     });
+    if (flags.claim && r.ownerConversationId !== OWNER_CONV_ID) {
+      throw new Error(`resume --claim failed to bind ownership (effective ownerConversationId=${r.ownerConversationId ?? "null"})`);
+    }
     console.log(JSON.stringify(r, null, 2));
     return;
   }
 
   if (cmd === "fork") {
     const r = await api(state, "POST", "/fork", {
+      ownerConversationId: OWNER_CONV_ID,
       threadId: positional[1],
       cwd: flags.cwd,
       model: flags.model,
@@ -414,6 +632,7 @@ async function main() {
 
   if (cmd === "send") {
     const r = await api(state, "POST", "/send", {
+      ownerConversationId: OWNER_CONV_ID,
       threadId: positional[1],
       model: flags.model,
       effort: flags.effort,
@@ -428,6 +647,7 @@ async function main() {
 
   if (cmd === "steer") {
     const r = await api(state, "POST", "/steer", {
+      ownerConversationId: OWNER_CONV_ID,
       threadId: positional[1],
       expectedTurnId: flags["turn-id"],
       fallbackSend: Boolean(flags["fallback-send"]),
@@ -459,11 +679,14 @@ async function main() {
   }
 
   if (cmd === "wait") {
-    const r = await api(
+    const r = await apiStrict(
       state,
       "POST",
       "/wait",
       {
+        ownerConversationId: OWNER_CONV_ID,
+        // Always declare batch support on new CLI so `--no-ack` still receives `ackBatchId` for manual `inbox ack`
+        supportsAckBatch: true,
         threadId: positional[1],
         after: flags.after ?? 0,
         timeout: timeoutSec,
@@ -472,7 +695,10 @@ async function main() {
       },
       (timeoutSec + 15) * 1000
     );
-    console.log(JSON.stringify(r));
+    await writeStdoutComplete(JSON.stringify(r) + "\n");
+    if (!flags["no-ack"] && r.ackBatchId) {
+      await sendBestEffortAck(state, r.ackBatchId, OWNER_CONV_ID);
+    }
     return;
   }
 
