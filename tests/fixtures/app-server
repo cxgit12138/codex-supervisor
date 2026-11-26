@@ -1,0 +1,289 @@
+// Mock `codex app-server --stdio` for deterministic E2E testing of codex-supervisor.
+// Executed via `node app-server --stdio` when CODEX_BIN=node and cwd contains this file.
+const readline = require("node:readline");
+
+let threadSeq = 1;
+let turnSeq = 1;
+let serverRpcId = 1000;
+const threadMeta = new Map();
+const pendingFromClient = new Map();
+
+function send(obj) {
+  process.stdout.write(JSON.stringify(obj) + "\n");
+}
+
+function sendServerReq(method, params, onReply) {
+  const id = serverRpcId++;
+  if (onReply) pendingFromClient.set(id, onReply);
+  send({ jsonrpc: "2.0", id, method, params });
+  return id;
+}
+
+const rl = readline.createInterface({ input: process.stdin });
+rl.on("line", (line) => {
+  if (!line.trim()) return;
+  let msg;
+  try {
+    msg = JSON.parse(line);
+  } catch {
+    return;
+  }
+
+  // Response from bridge-daemon to our server request
+  if (msg.id !== undefined && msg.method === undefined) {
+    const cb = pendingFromClient.get(msg.id);
+    if (cb) {
+      pendingFromClient.delete(msg.id);
+      cb(msg.result, msg.error);
+    }
+    return;
+  }
+
+  const { id, method, params = {} } = msg;
+
+  if (method === "initialize") {
+    return send({ jsonrpc: "2.0", id, result: { serverInfo: { name: "mock-codex", version: "1.0.0" } } });
+  }
+  if (method === "initialized") return;
+
+  if (method === "model/list") {
+    return send({ jsonrpc: "2.0", id, result: { models: [{ id: "mock-model", isDefault: true }] } });
+  }
+
+  if (method === "thread/start") {
+    const tid = `th-${threadSeq++}`;
+    threadMeta.set(tid, {
+      id: tid,
+      cwd: params.cwd || process.cwd(),
+      model: params.model || "mock-model",
+      sandbox: params.sandbox || "workspace-write",
+      approvalPolicy: params.approvalPolicy || "on-request",
+      name: null,
+    });
+    return send({ jsonrpc: "2.0", id, result: { thread: threadMeta.get(tid), ...threadMeta.get(tid) } });
+  }
+
+  if (method === "thread/name/set") {
+    const m = threadMeta.get(params.threadId);
+    if (m) m.name = params.name;
+    return send({ jsonrpc: "2.0", id, result: { ok: true } });
+  }
+
+  if (method === "thread/resume") {
+    const m = threadMeta.get(params.threadId) || {
+      id: params.threadId,
+      cwd: params.cwd || process.cwd(),
+      model: params.model || "mock-model",
+      sandbox: params.sandbox || "workspace-write",
+      approvalPolicy: params.approvalPolicy || "on-request",
+      name: "resumed",
+    };
+    threadMeta.set(m.id, m);
+    return send({ jsonrpc: "2.0", id, result: { thread: m, ...m } });
+  }
+
+  if (method === "thread/fork") {
+    const tid = `th-fork-${threadSeq++}`;
+    const src = threadMeta.get(params.threadId) || {};
+    const m = {
+      id: tid,
+      cwd: params.cwd || src.cwd || process.cwd(),
+      model: params.model || src.model || "mock-model",
+      sandbox: params.sandbox || src.sandbox || "workspace-write",
+      approvalPolicy: params.approvalPolicy || src.approvalPolicy || "on-request",
+      name: null,
+    };
+    threadMeta.set(tid, m);
+    return send({ jsonrpc: "2.0", id, result: { thread: m, ...m } });
+  }
+
+  if (method === "turn/steer") {
+    return send({ jsonrpc: "2.0", id, result: { turnId: params.expectedTurnId } });
+  }
+
+  if (method === "turn/interrupt") {
+    send({ jsonrpc: "2.0", id, result: { ok: true } });
+    setTimeout(() => {
+      send({
+        jsonrpc: "2.0",
+        method: "turn/completed",
+        params: { threadId: params.threadId, turn: { id: params.turnId, status: "interrupted" } },
+      });
+    }, 20);
+    return;
+  }
+
+  if (method === "turn/start") {
+    const tid = params.threadId;
+    const turnId = `turn-${turnSeq++}`;
+    const promptText = (params.input || []).map((x) => x.text || "").join("\n");
+    send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
+    send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: turnId } } });
+
+    const complete = (text = "done", delayMs = 20) => {
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "item/completed",
+          params: { threadId: tid, turnId, item: { id: `m-${turnId}`, type: "agentMessage", phase: "final_answer", text } },
+        });
+        send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: tid, turn: { id: turnId, status: "completed" } } });
+      }, delayMs);
+    };
+
+    if (promptText.startsWith("stay_running")) {
+      return;
+    }
+
+    if (promptText.startsWith("complete_after:")) {
+      const ms = Number(promptText.split(":")[1] || 80);
+      const body = promptText.split(":").slice(2).join(":") || "completed ok";
+      return complete(body, ms);
+    }
+
+    if (promptText.startsWith("sup_msg:")) {
+      const msgText = promptText.slice("sup_msg:".length);
+      setTimeout(() => {
+        sendServerReq("item/tool/call", {
+          threadId: tid,
+          turnId,
+          tool: "message_supervisor",
+          arguments: { message: msgText, wait_for_reply: false },
+        });
+      }, 15);
+      return;
+    }
+
+    if (promptText.startsWith("sup_question:")) {
+      const qText = promptText.slice("sup_question:".length);
+      setTimeout(() => {
+        sendServerReq(
+          "item/tool/call",
+          {
+            threadId: tid,
+            turnId,
+            tool: "message_supervisor",
+            arguments: { message: qText, wait_for_reply: true },
+          },
+          (res) => {
+            const ans = res?.contentItems?.[0]?.text || "ok";
+            complete(`got answer: ${ans}`, 15);
+          }
+        );
+      }, 15);
+      return;
+    }
+
+    if (promptText === "approval_then_server_resolve") {
+      setTimeout(() => {
+        const rpcId = sendServerReq("item/commandExecution/requestApproval", {
+          threadId: tid,
+          turnId,
+          command: "rm -rf /tmp/demo",
+          reason: "demo approval",
+        });
+        setTimeout(() => {
+          send({ jsonrpc: "2.0", method: "serverRequest/resolved", params: { threadId: tid, requestId: rpcId } });
+          complete("server resolved", 20);
+        }, 120);
+      }, 15);
+      return;
+    }
+
+    if (promptText === "flood_600_info_after_msg") {
+      setTimeout(() => {
+        sendServerReq("item/tool/call", {
+          threadId: tid,
+          turnId,
+          tool: "message_supervisor",
+          arguments: { message: "SURVIVE_600_INFO_FLOOD", wait_for_reply: false },
+        });
+        setTimeout(() => {
+          for (let i = 0; i < 600; i++) {
+            send({
+              jsonrpc: "2.0",
+              method: "item/completed",
+              params: { threadId: tid, turnId, item: { id: `cmd-${i}`, type: "commandExecution", command: `echo ${i}`, exitCode: 0 } },
+            });
+          }
+          complete("after 600 info", 30);
+        }, 30);
+      }, 15);
+      return;
+    }
+
+    if (promptText.startsWith("flood_sup_msgs:")) {
+      const count = Number(promptText.split(":")[1] || 55);
+      setTimeout(() => {
+        for (let i = 1; i <= count; i++) {
+          sendServerReq("item/tool/call", {
+            threadId: tid,
+            turnId,
+            tool: "message_supervisor",
+            arguments: { message: `MSG_${i}_` + "x".repeat(40), wait_for_reply: false },
+          });
+        }
+        if (promptText.includes(":complete")) {
+          complete("FINAL_AFTER_FLOOD", 40);
+        }
+      }, 15);
+      return;
+    }
+
+    if (promptText.startsWith("big_msg:")) {
+      const tag = promptText.slice("big_msg:".length);
+      setTimeout(() => {
+        sendServerReq("item/tool/call", {
+          threadId: tid,
+          turnId,
+          tool: "message_supervisor",
+          arguments: { message: `${tag}_` + "A".repeat(2400), wait_for_reply: false },
+        });
+      }, 15);
+      return;
+    }
+
+    if (promptText === "emit_40_pending_and_cn_msg") {
+      setTimeout(() => {
+        for (let i = 1; i <= 40; i++) {
+          sendServerReq("item/commandExecution/requestApproval", {
+            threadId: tid,
+            turnId,
+            command: `echo pending_cmd_${i}_` + "Z".repeat(300),
+            reason: `需要审批第 ${i} 个命令 ` + "测".repeat(80),
+          });
+        }
+        sendServerReq("item/tool/call", {
+          threadId: tid,
+          turnId,
+          tool: "message_supervisor",
+          arguments: { message: "中文关键通知_MUST_NOT_STARVE_" + "汉".repeat(120), wait_for_reply: false },
+        });
+      }, 15);
+      return;
+    }
+
+    if (promptText.startsWith("delayed_approval:")) {
+      const ms = Number(promptText.split(":")[1] || 120);
+      setTimeout(() => {
+        sendServerReq("item/commandExecution/requestApproval", {
+          threadId: tid,
+          turnId,
+          command: "git push --force",
+          reason: "delayed approval after ahead-of-head waiter",
+        });
+      }, ms);
+      return;
+    }
+
+    if (promptText === "crash_app_server") {
+      setTimeout(() => process.exit(2), 30);
+      return;
+    }
+
+    complete(`echo: ${promptText}`, 20);
+    return;
+  }
+
+  send({ jsonrpc: "2.0", id, error: { code: -32601, message: `Unsupported mock method: ${method}` } });
+});
