@@ -14,6 +14,24 @@ import os from "node:os";
 import crypto from "node:crypto";
 import readline from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { performance } from "node:perf_hooks";
+import {
+  DEFAULT_BG_MAX_RUN_SEC,
+  DEFAULT_BG_STALL_SEC,
+  MAX_ACTIVE_ITEMS,
+  boundedDigest,
+  boundedStringEdgeDigest,
+  classifyNonRetryableErrorCode,
+  computeBackgroundDeadline,
+  computeForegroundDeadline,
+  digestPatchChanges,
+  digestPlanUpdate,
+  formatActiveItemsSummary,
+  normalizeActiveItemType,
+  parseStrictInt,
+  parseWaitRequestParams,
+  parseWatchdogEnvSec,
+} from "./watchdog-core.mjs";
 
 const RAW_STATE_DIR = path.resolve(process.env.CODEX_BRIDGE_STATE_DIR || path.join(os.homedir(), ".gemini", "cache", "codex-supervisor"));
 
@@ -226,7 +244,10 @@ const COALESCE_MS = 300;
 const MAX_INLINE_TEXT = 2500;
 const MAX_THREAD_NOTIFS = 50;
 const MAX_GLOBAL_NOTIFS = 500;
-const BATCH_LEASE_MS = Number(process.env.CODEX_BRIDGE_LEASE_MS ?? 30_000);
+const BATCH_LEASE_MS =
+  process.env.CODEX_BRIDGE_LEASE_MS !== undefined && String(process.env.CODEX_BRIDGE_LEASE_MS).trim() !== ""
+    ? parseStrictInt(String(process.env.CODEX_BRIDGE_LEASE_MS), 100, 3_600_000, "CODEX_BRIDGE_LEASE_MS")
+    : 30_000;
 const HOOK_NUDGE_COOLDOWN_MS = Number(process.env.CODEX_BRIDGE_NUDGE_COOLDOWN_MS ?? 15_000);
 const FLAG_RETRY_MS = Number(process.env.CODEX_BRIDGE_FLAG_RETRY_MS ?? 5_000);
 const IDLE_SWEEP_MS = Number(process.env.CODEX_BRIDGE_IDLE_SWEEP_MS ?? 60_000);
@@ -234,6 +255,20 @@ const INBOX_MAX_BYTES = 16 * 1024;
 const INBOX_MAX_THREADS = 10;
 const INBOX_MAX_ITEMS = 20;
 const NOTIF_TTL_MS = Number(process.env.CODEX_BRIDGE_NOTIF_TTL_MS ?? 60 * 60 * 1000);
+const BG_STALL_SEC = parseWatchdogEnvSec(process.env.CODEX_BRIDGE_BG_STALL_SEC, DEFAULT_BG_STALL_SEC, "CODEX_BRIDGE_BG_STALL_SEC");
+const BG_MAX_RUN_SEC = parseWatchdogEnvSec(process.env.CODEX_BRIDGE_BG_MAX_RUN_SEC, DEFAULT_BG_MAX_RUN_SEC, "CODEX_BRIDGE_BG_MAX_RUN_SEC");
+const FG_AUTO_RECEIPT_LEASE_MS =
+  process.env.CODEX_BRIDGE_FG_AUTO_RECEIPT_MS !== undefined && String(process.env.CODEX_BRIDGE_FG_AUTO_RECEIPT_MS).trim() !== ""
+    ? parseStrictInt(String(process.env.CODEX_BRIDGE_FG_AUTO_RECEIPT_MS), 100, 60_000, "CODEX_BRIDGE_FG_AUTO_RECEIPT_MS")
+    : 5_000;
+const FG_MANUAL_RECEIPT_LEASE_MS =
+  process.env.CODEX_BRIDGE_FG_MANUAL_RECEIPT_MS !== undefined && String(process.env.CODEX_BRIDGE_FG_MANUAL_RECEIPT_MS).trim() !== ""
+    ? parseStrictInt(String(process.env.CODEX_BRIDGE_FG_MANUAL_RECEIPT_MS), 100, 120_000, "CODEX_BRIDGE_FG_MANUAL_RECEIPT_MS")
+    : Math.min(120_000, Math.max(100, BATCH_LEASE_MS));
+const MAX_COMPLETED_ITEM_IDS = 500;
+const MAX_SEEN_DEDUP = 500;
+const MAX_PATCH_DIGESTS = 50;
+const MAX_TURN_HISTORY = 100;
 const NORMAL_STOP_REASONS = new Set(["NO_TOOL_CALL"]);
 const INSTANCE_ID = `${process.pid}-${Date.now()}`;
 const INSTANCE_HOOKS_DIR = path.join(HOOKS_DIR, INSTANCE_ID);
@@ -612,6 +647,8 @@ let serverReqNextSeq = 1;
 let nextOwnerGen = 1;
 let nextNotifId = 1;
 let nextBatchSeq = 1;
+let globalBgTimerGen = 0;
+let nextAlertSeq = 1;
 let inboxRotateOffset = 0;
 const pendingServerRequests = new Map(); // reqId (string `${INSTANCE_ID}:${seq}`) -> entry
 const threads = new Map(); // threadId -> ThreadState
@@ -657,18 +694,55 @@ function setThreadOwnerRecord(threadId, ownerConversationId, ownerGen) {
   threadOwners.set(threadId, { ownerConversationId: ownerConversationId || null, ownerGen });
 }
 
+function createWatchdogState(turnId = null, ownerGen = 0) {
+  return {
+    turnId,
+    ownerGen,
+    bgTimer: null,
+    bgTimerGen: ++globalBgTimerGen,
+    activeBgNotifId: null,
+    pendingFgDelivery: null,
+    lastBgEnqueueMonoMs: 0,
+    lastDeliveredAlertMonoMs: 0,
+  };
+}
+
+function cancelWatchdogTimers(st, receiptOutcome = "cancelled", { reschedule = true } = {}) {
+  const wd = st?.watchdog;
+  if (!wd) return;
+  if (wd.bgTimer) {
+    clearTimeout(wd.bgTimer);
+    wd.bgTimer = null;
+  }
+  wd.bgTimerGen = ++globalBgTimerGen;
+  if (wd.pendingFgDelivery) {
+    const bid = wd.pendingFgDelivery.batchId;
+    settleFgTimeoutReceipt(bid, receiptOutcome, performance.now(), { reschedule });
+  }
+}
+
+function resetWatchdogState(st, receiptOutcome = "cancelled", { reschedule = true } = {}) {
+  cancelWatchdogTimers(st, receiptOutcome, { reschedule });
+  st.watchdog = createWatchdogState(st.activeTurnId, st.ownerGen);
+}
+
 function bindNewThreadOwner(st, rawConvId) {
   const convId = normalizeConversationId(rawConvId);
   const prevOwner = st.ownerConversationId;
   st.ownerConversationId = convId;
   st.ownerGen = nextOwnerGen++;
+  resetWatchdogState(st, "cancelled");
   setThreadOwnerRecord(st.threadId, st.ownerConversationId, st.ownerGen);
   if (prevOwner && prevOwner !== st.ownerConversationId) refreshConversationFlags(prevOwner);
   if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
 }
 
-function hasActiveBatchForThread(threadId, now = Date.now()) {
+function hasActiveBatchForThread(threadId, now = Date.now(), nowMono = performance.now()) {
   for (const b of activeBatches.values()) {
+    if (b.kind === "fg_timeout_receipt") {
+      if (b.threadId === threadId && nowMono < b.expiresAtMonoMs) return true;
+      continue;
+    }
     if (now >= b.expiresAt) continue;
     if (b.entries.some((e) => e.threadId === threadId)) return true;
   }
@@ -676,7 +750,7 @@ function hasActiveBatchForThread(threadId, now = Date.now()) {
 }
 
 function hasUnexpiredNotificationOrOverflow(st, now = Date.now()) {
-  if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen && now - n.createdAtMs < NOTIF_TTL_MS)) {
+  if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen && !n.retired && now - n.createdAtMs < NOTIF_TTL_MS)) {
     return true;
   }
   if (st.overflowTotal > st.overflowAckedThrough && (st.overflowUpdatedAtMs === 0 || now - st.overflowUpdatedAtMs < NOTIF_TTL_MS)) {
@@ -749,12 +823,35 @@ function hasEligibleWaiterForPending(st, reqEntry = null) {
   return false;
 }
 
-function hasEligibleWaiterForFuture(st) {
+function isOwnerWatchdogWaiter(st, w) {
   const headSeq = st.nextSeq - 1;
+  return Boolean(
+    isEligibleWaiterBase(st, w) &&
+      w.afterSeq <= headSeq &&
+      levelMatches("critical", w.eventsFilter)
+  );
+}
+
+function hasEligibleWaiterForFuture(st) {
   for (const w of st.waiters) {
-    if (isEligibleWaiterBase(st, w) && w.afterSeq <= headSeq && levelMatches("critical", w.eventsFilter)) {
+    if (isOwnerWatchdogWaiter(st, w)) {
       return true;
     }
+  }
+  return false;
+}
+
+function hasOwnerWatchdogCoverage(st) {
+  if (hasEligibleWaiterForFuture(st)) return true;
+  const wd = st.watchdog;
+  if (
+    wd &&
+    wd.turnId === st.activeTurnId &&
+    wd.ownerGen === st.ownerGen &&
+    wd.pendingFgDelivery &&
+    !wd.pendingFgDelivery.settled
+  ) {
+    return true;
   }
   return false;
 }
@@ -764,13 +861,15 @@ function computeConversationFlagState(conversationId) {
   let wantActive = false;
   for (const st of threads.values()) {
     if (st.ownerConversationId !== conversationId) continue;
-    const hasNotif = st.hookNotifications.some((n) => n.ownerGen === st.ownerGen);
+    const hasNotif = st.hookNotifications.some((n) => n.ownerGen === st.ownerGen && !n.retired);
     const hasOverflow = st.overflowTotal > st.overflowAckedThrough;
     let hasPending = false;
     for (const r of pendingServerRequests.values()) {
-      if (r.threadId === st.threadId && r.ownerGen === st.ownerGen) {
-        hasPending = true;
-        break;
+      if (r.threadId === st.threadId && r.ownerGen === st.ownerGen && !r.retired) {
+        if (!st.activeTurnId || !r.turnId || r.turnId === st.activeTurnId) {
+          hasPending = true;
+          break;
+        }
       }
     }
     if (hasNotif || hasOverflow || hasPending) {
@@ -820,6 +919,10 @@ function normalizeNotificationKind(kind, data) {
 
 const HOOK_NOTIFICATION_KINDS = new Set(["supervisor_message", "turn_completed", "turn_error", "daemon_error"]);
 
+function isLowPriorityEvictableKind(kind) {
+  return kind === "supervisor_message" || kind === "turn_watchdog";
+}
+
 function buildCompactNotifData(normKind, data) {
   const out = {};
   if (normKind === "supervisor_message") {
@@ -834,24 +937,75 @@ function buildCompactNotifData(normKind, data) {
     const errVal = data?.error?.message || data?.error || data?.message || "Unknown error";
     out.error = truncateText(String(typeof errVal === "string" ? errVal : JSON.stringify(errVal)), 1200);
     if (data?.lastMessage) out.message = truncateText(String(data.lastMessage), MAX_INLINE_TEXT);
+  } else if (normKind === "turn_watchdog") {
+    out.timeoutReason = data?.timeoutReason === "max_wait" ? "max_wait" : "stall";
+    out.observedAt = data?.observedAt || new Date().toISOString();
+    out.status = data?.status || "running";
+    out.silentSec = data?.silentSec ?? null;
+    if (data?.lastActivityTurnId !== undefined) out.lastActivityTurnId = data.lastActivityTurnId;
+    if (data?.lastActivityKind !== undefined) out.lastActivityKind = data.lastActivityKind;
+    if (data?.lastActivityAt !== undefined) out.lastActivityAt = data.lastActivityAt;
+    if (Array.isArray(data?.activeItems) && data.activeItems.length > 0) {
+      out.activeItems = data.activeItems;
+    }
+    if (typeof data?.activeItemsTotal === "number" && data.activeItemsTotal > 0) {
+      out.activeItemsTotal = data.activeItemsTotal;
+    }
+    if (data?.activeItemsTruncated) out.activeItemsTruncated = true;
+    if (data?.activeItemsApproximate) out.activeItemsApproximate = true;
+    if (data?.lastNonRetryableError) out.lastNonRetryableError = data.lastNonRetryableError;
   }
   return out;
 }
 
-function evictOneFromThreadNotifs(st, now) {
+/**
+ * Unified removal hook called whenever ANY item is removed from st.hookNotifications
+ * (eviction, TTL expiry, ACK, or turn-end retirement).
+ * Returns true if the thread's watchdog slot was freed and requires FG+BG rescheduling after commit.
+ */
+function onHookNotifRemoved(st, removedItem, { reason, nowMono = performance.now() }) {
+  if (!removedItem || removedItem.kind !== "turn_watchdog") return false;
+  const wd = st?.watchdog;
+  let slotFreed = false;
+  if (wd && wd.activeBgNotifId === removedItem.notifId) {
+    wd.activeBgNotifId = null;
+    slotFreed = true;
+  }
+  if (
+    reason === "ack" &&
+    wd &&
+    removedItem.ownerGen === st.ownerGen &&
+    removedItem.turnId &&
+    removedItem.turnId === st.activeTurnId &&
+    wd.turnId === st.activeTurnId &&
+    wd.ownerGen === st.ownerGen
+  ) {
+    wd.lastDeliveredAlertMonoMs = Math.max(wd.lastDeliveredAlertMonoMs || 0, nowMono);
+    st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+    return true;
+  }
+  return slotFreed;
+}
+
+function evictOneFromThreadNotifs(st, now, nowMono = performance.now(), freedThreads = null) {
   if (st.hookNotifications.length === 0) return false;
   const isUnleased = (n) => !n.leaseBatchId || now >= n.leaseUntil;
-  // Prefer evicting unleased supervisor_message -> unleased non-terminal -> unleased oldest -> leased supervisor_message -> oldest
-  let idx = st.hookNotifications.findIndex((n) => n.kind === "supervisor_message" && isUnleased(n));
+  // Prefer evicting unleased low-priority (supervisor_message / turn_watchdog) -> unleased non-terminal -> leased low-priority -> oldest
+  let idx = st.hookNotifications.findIndex((n) => isLowPriorityEvictableKind(n.kind) && isUnleased(n));
   if (idx === -1) idx = st.hookNotifications.findIndex((n) => isUnleased(n));
-  if (idx === -1) idx = st.hookNotifications.findIndex((n) => n.kind === "supervisor_message");
+  if (idx === -1) idx = st.hookNotifications.findIndex((n) => isLowPriorityEvictableKind(n.kind));
   if (idx === -1) idx = 0;
-  st.hookNotifications.splice(idx, 1);
-  recordOverflow(st, 1, now);
+  const [removed] = st.hookNotifications.splice(idx, 1);
+  if (!removed.retired) {
+    recordOverflow(st, 1, now);
+  }
+  if (onHookNotifRemoved(st, removed, { reason: "evicted", nowMono }) && freedThreads) {
+    freedThreads.add(st);
+  }
   return true;
 }
 
-function enforceGlobalNotifCap(now = Date.now()) {
+function enforceGlobalNotifCap(now = Date.now(), nowMono = performance.now(), freedThreads = null) {
   let total = 0;
   for (const st of threads.values()) total += st.hookNotifications.length;
   const isUnleased = (n) => !n.leaseBatchId || now >= n.leaseUntil;
@@ -873,13 +1027,18 @@ function enforceGlobalNotifCap(now = Date.now()) {
   };
   while (total > MAX_GLOBAL_NOTIFS) {
     const picked =
-      pickVictim((n) => n.kind === "supervisor_message" && isUnleased(n)) ||
+      pickVictim((n) => isLowPriorityEvictableKind(n.kind) && isUnleased(n)) ||
       pickVictim((n) => isUnleased(n)) ||
-      pickVictim((n) => n.kind === "supervisor_message") ||
+      pickVictim((n) => isLowPriorityEvictableKind(n.kind)) ||
       pickVictim(() => true);
     if (!picked) break;
-    picked.victimSt.hookNotifications.splice(picked.victimIdx, 1);
-    recordOverflow(picked.victimSt, 1, now);
+    const [removed] = picked.victimSt.hookNotifications.splice(picked.victimIdx, 1);
+    if (!removed.retired) {
+      recordOverflow(picked.victimSt, 1, now);
+    }
+    if (onHookNotifRemoved(picked.victimSt, removed, { reason: "evicted", nowMono }) && freedThreads) {
+      freedThreads.add(picked.victimSt);
+    }
     total--;
     if (picked.victimSt.ownerConversationId) refreshConversationFlags(picked.victimSt.ownerConversationId);
   }
@@ -888,10 +1047,14 @@ function enforceGlobalNotifCap(now = Date.now()) {
 function enqueueHookNotification(st, ev) {
   if (!HOOK_NOTIFICATION_KINDS.has(ev.kind)) return null;
   const now = Date.now();
+  const nowMono = performance.now();
+  const freedThreads = new Set();
   const normKind = normalizeNotificationKind(ev.kind, ev.data);
   const item = {
     notifId: `${INSTANCE_ID}:n${nextNotifId++}`,
     seq: ev.seq,
+    inboxOnly: false,
+    retired: false,
     kind: normKind,
     turnId: ev.turnId || null,
     ownerGen: st.ownerGen,
@@ -902,15 +1065,114 @@ function enqueueHookNotification(st, ev) {
   };
   st.hookNotifications.push(item);
   while (st.hookNotifications.length > MAX_THREAD_NOTIFS) {
-    if (!evictOneFromThreadNotifs(st, now)) break;
+    if (!evictOneFromThreadNotifs(st, now, nowMono, freedThreads)) break;
   }
-  enforceGlobalNotifCap(now);
+  enforceGlobalNotifCap(now, nowMono, freedThreads);
+  for (const ft of freedThreads) {
+    rescheduleWaiters(ft);
+    rescheduleBgWatchdog(ft);
+  }
   return item;
 }
 
-function pruneExpiredBatchesAndNotifications(now = Date.now()) {
+/**
+ * Atomic queue commit for inbox-only background watchdog alerts.
+ * Sets lastBgEnqueueMonoMs BEFORE eviction so self-eviction on full terminal queues
+ * never leaves a dangling activeBgNotifId or causes a 0ms re-enqueue storm.
+ */
+function commitBackgroundWatchdogAlert(st, alert, nowMono = performance.now()) {
+  if (shuttingDown || !st || !st.ownerConversationId || !st.activeTurnId || st.status !== "running") return null;
+  const wd = st.watchdog;
+  if (!wd || wd.turnId !== st.activeTurnId || wd.ownerGen !== st.ownerGen || wd.activeBgNotifId) return null;
+
+  const now = Date.now();
+  const freedThreads = new Set();
+  // Record enqueue timestamp BEFORE any eviction/reschedule
+  wd.lastBgEnqueueMonoMs = nowMono;
+
+  const item = {
+    notifId: `${INSTANCE_ID}:n${nextNotifId++}`,
+    seq: null,
+    inboxOnly: true,
+    retired: false,
+    kind: "turn_watchdog",
+    turnId: st.activeTurnId,
+    ownerGen: st.ownerGen,
+    data: buildCompactNotifData("turn_watchdog", alert),
+    createdAtMs: now,
+    leaseBatchId: null,
+    leaseUntil: 0,
+  };
+  st.hookNotifications.push(item);
+  while (st.hookNotifications.length > MAX_THREAD_NOTIFS) {
+    if (!evictOneFromThreadNotifs(st, now, nowMono, freedThreads)) break;
+  }
+  enforceGlobalNotifCap(now, nowMono, freedThreads);
+
+  // Only bind activeBgNotifId if the item survived cap eviction
+  const survived = st.hookNotifications.includes(item);
+  if (survived) {
+    wd.activeBgNotifId = item.notifId;
+  } else if (wd.activeBgNotifId === item.notifId) {
+    wd.activeBgNotifId = null;
+  }
+
+  refreshConversationFlags(st.ownerConversationId);
+  freedThreads.add(st);
+  for (const ft of freedThreads) {
+    rescheduleWaiters(ft);
+    rescheduleBgWatchdog(ft);
+  }
+  return survived ? item : null;
+}
+
+/**
+ * Retire obsolete turn_watchdog notifications for an ended or superseded turn:
+ * - Unleased items are deleted immediately;
+ * - Currently leased items are marked `retired: true` so lease expiry deletes them
+ *   rather than reopening them as claimable (while timely ACK still settles cleanly).
+ */
+function retireTurnWatchdogNotifs(st, turnId = null, now = Date.now(), nowMono = performance.now(), { reschedule = true } = {}) {
+  if (!st || st.hookNotifications.length === 0) return;
+  let changed = false;
+  let slotFreed = false;
+  for (let i = st.hookNotifications.length - 1; i >= 0; i--) {
+    const n = st.hookNotifications[i];
+    if (n.kind !== "turn_watchdog") continue;
+    if (turnId && n.turnId && n.turnId !== turnId) continue;
+    const isLeased = Boolean(n.leaseBatchId && now < n.leaseUntil);
+    if (isLeased) {
+      n.retired = true;
+      if (st.watchdog && st.watchdog.activeBgNotifId === n.notifId) {
+        st.watchdog.activeBgNotifId = null;
+        slotFreed = true;
+      }
+      changed = true;
+    } else {
+      st.hookNotifications.splice(i, 1);
+      if (onHookNotifRemoved(st, n, { reason: "retired", nowMono })) {
+        slotFreed = true;
+      }
+      changed = true;
+    }
+  }
+  if (changed && st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
+  if (slotFreed && reschedule) {
+    rescheduleWaiters(st);
+    rescheduleBgWatchdog(st);
+  }
+}
+
+function pruneExpiredBatchesAndNotifications(now = Date.now(), nowMono = performance.now()) {
   const affectedConvs = new Set();
-  for (const [bid, batch] of activeBatches.entries()) {
+  const freedThreads = new Set();
+  for (const [bid, batch] of Array.from(activeBatches.entries())) {
+    if (batch.kind === "fg_timeout_receipt") {
+      if (nowMono >= batch.expiresAtMonoMs) {
+        settleFgTimeoutReceipt(bid, "expired", nowMono);
+      }
+      continue;
+    }
     if (now >= batch.expiresAt) {
       activeBatches.delete(bid);
       if (batch.conversationId) affectedConvs.add(batch.conversationId);
@@ -923,10 +1185,23 @@ function pruneExpiredBatchesAndNotifications(now = Date.now()) {
       if (n.leaseBatchId && now >= n.leaseUntil) {
         n.leaseBatchId = null;
         n.leaseUntil = 0;
+        if (n.retired) {
+          st.hookNotifications.splice(i, 1);
+          if (onHookNotifRemoved(st, n, { reason: "retired", nowMono })) {
+            freedThreads.add(st);
+          }
+          changed = true;
+          continue;
+        }
       }
       if (now - n.createdAtMs >= NOTIF_TTL_MS) {
         st.hookNotifications.splice(i, 1);
-        recordOverflow(st, 1, now);
+        if (!n.retired) {
+          recordOverflow(st, 1, now);
+        }
+        if (onHookNotifRemoved(st, n, { reason: "ttl", nowMono })) {
+          freedThreads.add(st);
+        }
         changed = true;
       }
     }
@@ -937,24 +1212,30 @@ function pruneExpiredBatchesAndNotifications(now = Date.now()) {
     if (changed && st.ownerConversationId) affectedConvs.add(st.ownerConversationId);
   }
   for (const c of affectedConvs) refreshConversationFlags(c);
+  for (const ft of freedThreads) {
+    rescheduleWaiters(ft);
+    rescheduleBgWatchdog(ft);
+  }
 }
 
 /**
  * Unified synchronous batch issuance shared by `/inbox` and `/wait`.
  * Only leases notifications that currently have NO unexpired lease; first channel wins.
  */
-function issueAckBatch(conversationId, candidates, now = Date.now()) {
-  pruneExpiredBatchesAndNotifications(now);
+function issueAckBatch(conversationId, candidates, now = Date.now(), { skipPrune = false } = {}) {
+  if (!skipPrune) {
+    pruneExpiredBatchesAndNotifications(now);
+  }
   const entries = [];
   const toLease = [];
 
   for (const cand of candidates) {
-    const { st, notifIds = [], pendingReqIds = [], includeOverflow = false } = cand;
+    const { st, notifIds = [], pendingReqIds = [], includeOverflow = false, overflowThrough: explicitOverflowThrough = 0 } = cand;
     if (!st) continue;
     const wantedNotifSet = new Set(notifIds);
     const leasedNotifIds = [];
     for (const n of st.hookNotifications) {
-      if (n.ownerGen !== st.ownerGen) continue;
+      if (n.ownerGen !== st.ownerGen || n.retired) continue;
       if (!wantedNotifSet.has(n.notifId)) continue;
       if (n.leaseBatchId && now < n.leaseUntil) continue; // Already held by another active batch
       leasedNotifIds.push(n.notifId);
@@ -964,12 +1245,19 @@ function issueAckBatch(conversationId, candidates, now = Date.now()) {
     const validPendingIds = [];
     for (const reqId of pendingReqIds) {
       const r = pendingServerRequests.get(reqId);
-      if (r && r.threadId === st.threadId && r.ownerGen === st.ownerGen) {
+      if (r && !r.retired && r.threadId === st.threadId && r.ownerGen === st.ownerGen) {
         validPendingIds.push(reqId);
       }
     }
 
-    const overflowThrough = includeOverflow && st.overflowTotal > st.overflowAckedThrough ? st.overflowTotal : 0;
+    // Use the exact rendered watermark when supplied by /inbox so ACK never acknowledges unrendered overflow
+    let overflowThrough = 0;
+    if (explicitOverflowThrough > 0) {
+      const clamped = Math.min(explicitOverflowThrough, st.overflowTotal);
+      if (clamped > st.overflowAckedThrough) overflowThrough = clamped;
+    } else if (includeOverflow && st.overflowTotal > st.overflowAckedThrough) {
+      overflowThrough = st.overflowTotal;
+    }
 
     if (leasedNotifIds.length > 0 || validPendingIds.length > 0 || overflowThrough > 0) {
       entries.push({
@@ -992,6 +1280,7 @@ function issueAckBatch(conversationId, candidates, now = Date.now()) {
   }
 
   activeBatches.set(batchId, {
+    kind: "inbox_wait",
     batchId,
     instanceId: INSTANCE_ID,
     conversationId: conversationId || null,
@@ -1020,10 +1309,11 @@ function getThreadState(threadId) {
   if (!st) {
     const logPath = path.join(LOGS_DIR, `${threadId.replace(/[^a-zA-Z0-9_-]/g, "_")}.jsonl`);
     const savedOwner = threadOwners.get(threadId);
+    const ownerGen = savedOwner?.ownerGen ?? 0;
     st = {
       threadId,
       ownerConversationId: savedOwner?.ownerConversationId ?? null,
-      ownerGen: savedOwner?.ownerGen ?? 0,
+      ownerGen,
       name: null,
       cwd: null,
       model: null,
@@ -1032,7 +1322,26 @@ function getThreadState(threadId) {
       status: "idle", // idle | running | waiting_input | error
       activeTurnId: null,
       lastTurnId: null,
+      turnEpoch: 0,
+      startedTurnIds: new Set(),
+      turnStartedEventEmitted: new Set(),
       completedTurnIds: new Set(),
+      supersededTurnIds: new Set(),
+      turnRunningSinceMonoMs: 0,
+      lastProgressMonoMs: 0,
+      lastProgressTurnId: null,
+      lastProgressKind: null,
+      lastProgressAt: null,
+      lastDeliveredContactMonoMs: 0,
+      lastNonRetryableError: null,
+      activeItems: new Map(), // itemId -> { type, startedMonoMs } (cap MAX_ACTIVE_ITEMS = 200)
+      activeItemsOverflowed: false,
+      completedItemIds: new Set(), // FIFO tombstone window (cap MAX_COMPLETED_ITEM_IDS = 500)
+      seenReasoningParts: new Set(),
+      seenAutoApprovalReviews: new Set(),
+      lastPlanDigest: null,
+      lastDiffDigest: null,
+      lastPatchDigests: new Map(),
       lastError: null,
       lastMessage: "",
       lastMessageTurnId: null,
@@ -1055,12 +1364,297 @@ function getThreadState(threadId) {
       overflowAckedThrough: 0,
       overflowUpdatedAtMs: 0,
       waiters: new Set(),
+      watchdog: createWatchdogState(null, ownerGen),
       logPath,
       updatedAt: Date.now(),
     };
     threads.set(threadId, st);
   }
   return st;
+}
+
+function addBoundedSet(set, key, maxSize) {
+  if (set.has(key)) return false;
+  set.add(key);
+  if (set.size > maxSize) {
+    const oldest = set.values().next().value;
+    set.delete(oldest);
+  }
+  return true;
+}
+
+function setBoundedMap(map, key, value, maxSize) {
+  if (!map.has(key) && map.size >= maxSize) {
+    const oldest = map.keys().next().value;
+    map.delete(oldest);
+  }
+  map.set(key, value);
+}
+
+function clearTurnActivityContainers(st) {
+  st.activeItems.clear();
+  st.activeItemsOverflowed = false;
+  st.completedItemIds.clear();
+  st.seenReasoningParts.clear();
+  st.seenAutoApprovalReviews.clear();
+  st.lastPlanDigest = null;
+  st.lastDiffDigest = null;
+  st.lastPatchDigests.clear();
+  st.lastNonRetryableError = null;
+}
+
+function computeSilentSec(st, nowMono = performance.now()) {
+  if (!st || !st.activeTurnId || st.status !== "running") return null;
+  const turnProgressAnchor = st.lastProgressTurnId === st.activeTurnId ? (st.lastProgressMonoMs || 0) : 0;
+  const anchor = Math.max(st.turnRunningSinceMonoMs || 0, turnProgressAnchor);
+  if (anchor <= 0) return null;
+  return Math.max(0, Math.floor((nowMono - anchor) / 1000));
+}
+
+function buildWatchdogDiagnostics(st, nowMono = performance.now()) {
+  const activeSummary = formatActiveItemsSummary(st.activeItems, st.activeItemsOverflowed, nowMono);
+  const diag = {
+    status: st.status,
+    activeTurnId: st.activeTurnId,
+    observedAt: new Date().toISOString(),
+    silentSec: computeSilentSec(st, nowMono),
+    lastActivityTurnId: st.lastProgressTurnId,
+    lastActivityKind: st.lastProgressKind,
+    lastActivityAt: st.lastProgressAt,
+  };
+  if (activeSummary.activeItems.length > 0) {
+    diag.activeItems = activeSummary.activeItems;
+  }
+  if (activeSummary.activeItemsTotal > 0 || activeSummary.activeItemsApproximate) {
+    diag.activeItemsTotal = activeSummary.activeItemsTotal;
+  }
+  if (activeSummary.activeItemsTruncated) diag.activeItemsTruncated = true;
+  if (activeSummary.activeItemsApproximate) diag.activeItemsApproximate = true;
+  if (st.lastNonRetryableError && st.lastNonRetryableError.turnId === st.activeTurnId) {
+    diag.lastNonRetryableError = st.lastNonRetryableError;
+  }
+  return diag;
+}
+
+function recordTurnProgress(st, turnId, kind, nowMono = performance.now()) {
+  if (!st || !turnId || !st.activeTurnId || turnId !== st.activeTurnId) return false;
+  if (st.status !== "running") return false;
+  st.lastProgressMonoMs = Math.max(st.lastProgressMonoMs || 0, nowMono);
+  st.lastProgressTurnId = turnId;
+  st.lastProgressKind = kind;
+  st.lastProgressAt = new Date().toISOString();
+  st.updatedAt = Date.now();
+  return true;
+}
+
+function isWatchdogSlotOccupied(st) {
+  const wd = st?.watchdog;
+  return Boolean(
+    wd &&
+      wd.turnId === st.activeTurnId &&
+      wd.ownerGen === st.ownerGen &&
+      (wd.activeBgNotifId || (wd.pendingFgDelivery && !wd.pendingFgDelivery.settled))
+  );
+}
+
+function scheduleWaiterTimeout(st, waiter) {
+  if (!st || !st.waiters.has(waiter)) return;
+  if (waiter.timer) {
+    clearTimeout(waiter.timer);
+    waiter.timer = null;
+  }
+  const nowMono = performance.now();
+  const isTurnRunning = Boolean(st.activeTurnId && st.status === "running");
+  const slotOccupied = isWatchdogSlotOccupied(st);
+  const wd = st.watchdog;
+  const turnProgressAnchor = st.lastProgressTurnId === st.activeTurnId ? (st.lastProgressMonoMs || 0) : 0;
+  const ackedAlertAnchor =
+    wd && wd.turnId === st.activeTurnId && wd.ownerGen === st.ownerGen ? (wd.lastDeliveredAlertMonoMs || 0) : 0;
+
+  const plan = computeForegroundDeadline({
+    nowMono,
+    waitStartMonoMs: waiter.waitStartMonoMs,
+    hardDeadlineMonoMs: waiter.hardDeadlineMonoMs,
+    stallTimeoutSec: waiter.stallTimeoutSec,
+    isTurnRunning,
+    slotOccupied,
+    turnRunningSinceMonoMs: st.turnRunningSinceMonoMs,
+    lastProgressMonoMs: turnProgressAnchor,
+    lastDeliveredAlertMonoMs: ackedAlertAnchor,
+  });
+
+  if (!plan.shouldFire) {
+    waiter.timer = setTimeout(() => scheduleWaiterTimeout(st, waiter), Math.ceil(plan.delayMs));
+    return;
+  }
+  resolveWaiter(st, waiter, true, plan.timeoutReason);
+}
+
+function rescheduleWaiters(st) {
+  if (!st || st.waiters.size === 0) return;
+  for (const w of Array.from(st.waiters)) {
+    if (st.waiters.has(w)) {
+      scheduleWaiterTimeout(st, w);
+    }
+  }
+}
+
+function scheduleBgWatchdog(st) {
+  if (!st || !st.watchdog) return;
+  const wd = st.watchdog;
+  if (wd.bgTimer) {
+    clearTimeout(wd.bgTimer);
+    wd.bgTimer = null;
+  }
+  wd.bgTimerGen = ++globalBgTimerGen;
+
+  if (shuttingDown) return;
+  if (BG_STALL_SEC <= 0 && BG_MAX_RUN_SEC <= 0) return;
+  if (!st.ownerConversationId) return;
+  if (!st.activeTurnId || st.status !== "running") return;
+  if (wd.turnId !== st.activeTurnId || wd.ownerGen !== st.ownerGen) return;
+  if (wd.activeBgNotifId) return;
+  if (hasOwnerWatchdogCoverage(st)) return;
+
+  const nowMono = performance.now();
+  const turnProgressAnchor = st.lastProgressTurnId === st.activeTurnId ? (st.lastProgressMonoMs || 0) : 0;
+  const plan = computeBackgroundDeadline({
+    nowMono,
+    bgStallSec: BG_STALL_SEC,
+    bgMaxRunSec: BG_MAX_RUN_SEC,
+    turnRunningSinceMonoMs: st.turnRunningSinceMonoMs,
+    lastProgressMonoMs: turnProgressAnchor,
+    lastDeliveredContactMonoMs: st.lastDeliveredContactMonoMs,
+    lastDeliveredAlertMonoMs: wd.lastDeliveredAlertMonoMs,
+    lastBgEnqueueMonoMs: wd.lastBgEnqueueMonoMs,
+  });
+
+  if (!plan.enabled) return;
+
+  const capturedWatchdog = wd;
+  const capturedTimerGen = wd.bgTimerGen;
+  const capturedTurnId = st.activeTurnId;
+  const capturedOwnerGen = st.ownerGen;
+
+  if (!plan.shouldFire) {
+    wd.bgTimer = setTimeout(() => {
+      if (shuttingDown) return;
+      if (threads.get(st.threadId) !== st) return;
+      if (st.watchdog !== capturedWatchdog || capturedTimerGen !== capturedWatchdog.bgTimerGen) return;
+      if (!st.ownerConversationId || st.activeTurnId !== capturedTurnId || st.ownerGen !== capturedOwnerGen) return;
+      if (st.status !== "running" || hasOwnerWatchdogCoverage(st) || capturedWatchdog.activeBgNotifId) return;
+      scheduleBgWatchdog(st);
+    }, Math.ceil(plan.delayMs));
+    return;
+  }
+
+  const diag = buildWatchdogDiagnostics(st, nowMono);
+  commitBackgroundWatchdogAlert(
+    st,
+    {
+      alertId: `${INSTANCE_ID}:a${nextAlertSeq++}`,
+      timeoutReason: plan.timeoutReason,
+      turnId: st.activeTurnId,
+      ownerGen: st.ownerGen,
+      ...diag,
+    },
+    nowMono
+  );
+}
+
+function rescheduleBgWatchdog(st) {
+  scheduleBgWatchdog(st);
+}
+
+function settleFgTimeoutReceipt(batchId, outcome, nowMono = performance.now(), { reschedule = true } = {}) {
+  const batch = activeBatches.get(batchId);
+  if (!batch || batch.kind !== "fg_timeout_receipt") return false;
+  const receipt = batch.receipt;
+  if (!receipt || receipt.settled) return false;
+  receipt.settled = true;
+
+  activeBatches.delete(batchId);
+  if (receipt.timer) {
+    clearTimeout(receipt.timer);
+    receipt.timer = null;
+  }
+  if (receipt.res) {
+    if (receipt.onClose) receipt.res.off("close", receipt.onClose);
+    if (receipt.onError) receipt.res.off("error", receipt.onError);
+  }
+
+  const st = threads.get(receipt.threadId);
+  const sameContext = Boolean(
+    st &&
+      st.watchdog === receipt.watchdog &&
+      st.activeTurnId === receipt.turnId &&
+      st.ownerGen === receipt.ownerGen
+  );
+
+  if (st && st.watchdog === receipt.watchdog && st.watchdog.pendingFgDelivery === receipt) {
+    st.watchdog.pendingFgDelivery = null;
+  }
+
+  if (!st) return true;
+
+  if (outcome === "acked") {
+    if (sameContext) {
+      st.watchdog.lastDeliveredAlertMonoMs = Math.max(st.watchdog.lastDeliveredAlertMonoMs || 0, nowMono);
+      st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+    }
+    if (reschedule) {
+      rescheduleWaiters(st);
+      rescheduleBgWatchdog(st);
+    }
+    return true;
+  }
+
+  if (outcome === "expired" || outcome === "aborted") {
+    if (sameContext && st.status === "running" && !st.watchdog.activeBgNotifId) {
+      const reason = receipt.alert?.timeoutReason;
+      if (reason === "stall" && BG_STALL_SEC > 0) {
+        commitBackgroundWatchdogAlert(st, receipt.alert, nowMono);
+        return true;
+      }
+      if (reason === "max_wait" && BG_MAX_RUN_SEC > 0) {
+        // Condition 2: only hand off unacked foreground max_wait to inbox if the background max-run budget has actually elapsed
+        const bgMaxAnchor = Math.max(
+          st.turnRunningSinceMonoMs || 0,
+          st.lastDeliveredContactMonoMs || 0,
+          st.watchdog.lastDeliveredAlertMonoMs || 0,
+          st.watchdog.lastBgEnqueueMonoMs || 0
+        );
+        if (nowMono >= bgMaxAnchor + BG_MAX_RUN_SEC * 1000) {
+          commitBackgroundWatchdogAlert(st, receipt.alert, nowMono);
+          return true;
+        }
+      }
+    }
+    if (reschedule) {
+      // Condition 1: always reschedule BOTH affected foreground waiters AND background watchdog after slot release
+      rescheduleWaiters(st);
+      rescheduleBgWatchdog(st);
+    }
+    return true;
+  }
+
+  // outcome === "cancelled" (silent cleanup when caller is committing turn termination/replacement/shutdown!)
+  if (reschedule) {
+    rescheduleWaiters(st);
+  }
+  return true;
+}
+
+function onTurnEnteredRunning(st, nowMono = performance.now(), { creditContact = false } = {}) {
+  st.turnRunningSinceMonoMs = nowMono;
+  st.lastProgressMonoMs = Math.max(st.lastProgressMonoMs || 0, nowMono);
+  st.lastProgressTurnId = st.activeTurnId;
+  st.lastProgressAt = new Date().toISOString();
+  if (creditContact) {
+    st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+  }
+  rescheduleWaiters(st);
+  rescheduleBgWatchdog(st);
 }
 
 function appendThreadLog(st, record) {
@@ -1163,9 +1757,9 @@ function compactRequest(r) {
   return out;
 }
 
-function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter, rendered = null }) {
+function buildWaitPayload(st, { timedOut, timeoutReason = "max_wait", waitStartMonoMs = 0, matched, gap, eventsFilter, rendered = null }) {
   const latestSeq = st.nextSeq - 1;
-  const pending = listPendingRequests(st.threadId).map(compactRequest);
+  const pending = listPendingRequestsForTurn(st.threadId, st.activeTurnId).map(compactRequest);
   const actualTimedOut = matched.length > 0 ? false : Boolean(timedOut);
 
   const terminalEvs = matched.filter((e) => e.kind === "turn_completed" || e.kind === "turn_error" || e.kind === "daemon_error");
@@ -1306,6 +1900,22 @@ function buildWaitPayload(st, { timedOut, matched, gap, eventsFilter, rendered =
   } else if (wakeup === "plan_updated" && planEv) {
     out.plan = planEv.data;
   } else if (wakeup === "timeout") {
+    const nowMono = performance.now();
+    const diag = buildWatchdogDiagnostics(st, nowMono);
+    out.timeoutReason = timeoutReason === "stall" ? "stall" : "max_wait";
+    out.status = diag.status;
+    out.activeTurnId = diag.activeTurnId;
+    out.observedAt = diag.observedAt;
+    out.waitElapsedSec = waitStartMonoMs > 0 ? Math.max(0, Math.floor((nowMono - waitStartMonoMs) / 1000)) : 0;
+    out.silentSec = diag.silentSec;
+    out.lastActivityTurnId = diag.lastActivityTurnId;
+    out.lastActivityKind = diag.lastActivityKind;
+    out.lastActivityAt = diag.lastActivityAt;
+    if (diag.activeItems) out.activeItems = diag.activeItems;
+    if (diag.activeItemsTotal !== undefined) out.activeItemsTotal = diag.activeItemsTotal;
+    if (diag.activeItemsTruncated) out.activeItemsTruncated = true;
+    if (diag.activeItemsApproximate) out.activeItemsApproximate = true;
+    if (diag.lastNonRetryableError) out.lastNonRetryableError = diag.lastNonRetryableError;
     const draft = st.deltaBuffers.size > 0 ? truncateText(Array.from(st.deltaBuffers.values()).join("\n"), 500) : "";
     if (draft) out.inFlightDraft = draft;
   } else if (wakeup === "cursor_gap") {
@@ -1365,21 +1975,130 @@ function attachWaitAckBatch(st, payload, rendered, { supportsAckBatch, ownerConv
   return payload;
 }
 
-function resolveWaiter(st, waiter, timedOut = false) {
-  if (!cleanupWaiter(st, waiter)) return;
+function resolveWaiter(st, waiter, timedOut = false, requestedTimeoutReason = "max_wait") {
+  if (!st.waiters.has(waiter)) return;
   const matched = st.events.filter((e) => e.seq > waiter.afterSeq && levelMatches(e.level, waiter.eventsFilter));
   const gap = detectCursorGap(st, waiter.afterSeq, waiter.afterProvided, waiter.instanceMismatch);
   const rendered = { notifSeqs: new Set(), reqIds: new Set() };
-  const payload = buildWaitPayload(st, { timedOut, matched, gap, eventsFilter: waiter.eventsFilter, rendered });
+  const payload = buildWaitPayload(st, {
+    timedOut,
+    timeoutReason: requestedTimeoutReason,
+    waitStartMonoMs: waiter.waitStartMonoMs,
+    matched,
+    gap,
+    eventsFilter: waiter.eventsFilter,
+    rendered,
+  });
+
+  if (payload.wakeup === "timeout") {
+    const nowMono = performance.now();
+    const canClaimReceiptSlot = Boolean(
+      isWaiterConnected(waiter) &&
+        st.activeTurnId &&
+        st.status === "running" &&
+        isOwnerWatchdogWaiter(st, waiter) &&
+        waiter.timeoutReceiptMode &&
+        waiter.timeoutReceiptMode !== "none" &&
+        st.watchdog &&
+        st.watchdog.turnId === st.activeTurnId &&
+        st.watchdog.ownerGen === st.ownerGen &&
+        !st.watchdog.pendingFgDelivery &&
+        !st.watchdog.activeBgNotifId
+    );
+
+    if (canClaimReceiptSlot) {
+      const leaseMs = waiter.timeoutReceiptMode === "manual" ? FG_MANUAL_RECEIPT_LEASE_MS : FG_AUTO_RECEIPT_LEASE_MS;
+      const batchId = `${INSTANCE_ID}:b${nextBatchSeq++}`;
+      const alertId = `${INSTANCE_ID}:a${nextAlertSeq++}`;
+      const expiresAtMonoMs = nowMono + leaseMs;
+      const expiresAt = Date.now() + leaseMs;
+      const alertSnapshot = {
+        alertId,
+        timeoutReason: payload.timeoutReason,
+        turnId: st.activeTurnId,
+        ownerGen: st.ownerGen,
+        observedAt: payload.observedAt,
+        status: payload.status,
+        silentSec: payload.silentSec,
+        lastActivityTurnId: payload.lastActivityTurnId,
+        lastActivityKind: payload.lastActivityKind,
+        lastActivityAt: payload.lastActivityAt,
+        ...(payload.activeItems ? { activeItems: payload.activeItems } : {}),
+        ...(payload.activeItemsTotal !== undefined ? { activeItemsTotal: payload.activeItemsTotal } : {}),
+        ...(payload.activeItemsTruncated ? { activeItemsTruncated: true } : {}),
+        ...(payload.activeItemsApproximate ? { activeItemsApproximate: true } : {}),
+        ...(payload.lastNonRetryableError ? { lastNonRetryableError: payload.lastNonRetryableError } : {}),
+      };
+
+      const receipt = {
+        batchId,
+        alertId,
+        threadId: st.threadId,
+        turnId: st.activeTurnId,
+        ownerGen: st.ownerGen,
+        watchdog: st.watchdog,
+        alert: alertSnapshot,
+        res: waiter.res,
+        settled: false,
+        timer: null,
+        onClose: null,
+        onError: null,
+      };
+
+      // Claim pendingFgDelivery BEFORE cleanupWaiter so foreground coverage transfers atomically with zero gap
+      st.watchdog.pendingFgDelivery = receipt;
+      activeBatches.set(batchId, {
+        kind: "fg_timeout_receipt",
+        batchId,
+        instanceId: INSTANCE_ID,
+        conversationId: waiter.ownerConversationId || null,
+        threadId: st.threadId,
+        turnId: st.activeTurnId,
+        ownerGen: st.ownerGen,
+        alertId,
+        expiresAtMonoMs,
+        expiresAt,
+        receipt,
+      });
+      payload.ackBatchId = batchId;
+      payload.ackExpiresAt = expiresAt;
+
+      cleanupWaiter(st, waiter);
+
+      receipt.onClose = () => {
+        if (!receipt.res.writableFinished) {
+          settleFgTimeoutReceipt(batchId, "aborted");
+        }
+      };
+      receipt.onError = () => {
+        settleFgTimeoutReceipt(batchId, "aborted");
+      };
+      receipt.res.once("close", receipt.onClose);
+      receipt.res.once("error", receipt.onError);
+      receipt.timer = setTimeout(() => settleFgTimeoutReceipt(batchId, "expired"), leaseMs);
+
+      waiter.resolve(payload);
+      return;
+    }
+
+    cleanupWaiter(st, waiter);
+    rescheduleBgWatchdog(st);
+    waiter.resolve(payload);
+    return;
+  }
+
+  cleanupWaiter(st, waiter);
   if (isWaiterConnected(waiter)) {
     attachWaitAckBatch(st, payload, rendered, waiter);
   }
+  rescheduleBgWatchdog(st);
   waiter.resolve(payload);
 }
 
 function pushEvent(threadId, level, kind, turnId, data) {
   const st = getThreadState(threadId);
   st.updatedAt = Date.now();
+  const prevHead = st.nextSeq - 1;
   const ev = {
     seq: st.nextSeq++,
     ts: new Date().toISOString(),
@@ -1400,6 +2119,15 @@ function pushEvent(threadId, level, kind, turnId, data) {
     enqueueHookNotification(st, ev);
   }
 
+  // If any ahead-of-head waiter just caught up with nextSeq - 1, re-evaluate background coverage
+  let coverageChanged = false;
+  for (const w of st.waiters) {
+    if (w.afterSeq > prevHead && w.afterSeq <= ev.seq) {
+      coverageChanged = true;
+      break;
+    }
+  }
+
   for (const waiter of Array.from(st.waiters)) {
     if (ev.seq <= waiter.afterSeq) continue;
     if (!levelMatches(ev.level, waiter.eventsFilter)) continue;
@@ -1409,6 +2137,10 @@ function pushEvent(threadId, level, kind, turnId, data) {
     } else if (!waiter.coalesceTimer) {
       waiter.coalesceTimer = setTimeout(() => resolveWaiter(st, waiter, false), COALESCE_MS);
     }
+  }
+
+  if (coverageChanged) {
+    rescheduleBgWatchdog(st);
   }
 
   if (st.ownerConversationId && (level === "critical" || kind === "turn_started")) {
@@ -1421,7 +2153,9 @@ function prunePendingRequestsForThread(threadId, turnId = null) {
   let removed = false;
   for (const [reqId, r] of pendingServerRequests.entries()) {
     if (r.threadId !== threadId) continue;
-    if (turnId && r.turnId && r.turnId !== turnId) continue;
+    // Exact turnId match when turnId is specified; never delete turnId-less entries under a specific turnId
+    if (turnId !== null && r.turnId !== turnId) continue;
+    r.retired = true;
     pendingServerRequests.delete(reqId);
     removed = true;
   }
@@ -1431,9 +2165,64 @@ function prunePendingRequestsForThread(threadId, turnId = null) {
   }
 }
 
+function buildCancelReplyForRequest(entry, reasonText = "Turn superseded or stale request rejected") {
+  if (entry.method === "item/commandExecution/requestApproval" || entry.method === "item/fileChange/requestApproval") {
+    return { result: buildServerRequestResponse(entry, { decision: "cancel" }) };
+  }
+  if (entry.method === "applyPatchApproval" || entry.method === "execCommandApproval") {
+    return { result: buildServerRequestResponse(entry, { decision: "cancel" }) };
+  }
+  if (entry.method === "item/permissions/requestApproval") {
+    return { result: buildServerRequestResponse(entry, { decision: "cancel", scope: "turn" }) };
+  }
+  if (entry.method === "item/tool/call") {
+    return {
+      result: {
+        success: false,
+        contentItems: [{ type: "inputText", text: reasonText }],
+      },
+    };
+  }
+  return { error: { code: -32000, message: reasonText } };
+}
+
+function sendCancelReplyOnce(entry, reasonText) {
+  if (entry.replyClaimed) return false;
+  entry.replyClaimed = true;
+  const reply = buildCancelReplyForRequest(entry, reasonText);
+  const payload = reply.error
+    ? { jsonrpc: "2.0", id: entry.rpcId, error: reply.error }
+    : { jsonrpc: "2.0", id: entry.rpcId, result: reply.result };
+  sendJsonRpcAsync(payload).catch((e) => logDaemon(`Failed to send cancel reply rpcId=${entry.rpcId}: ${e.message}`));
+  return true;
+}
+
+function retirePendingRequestsForTurn(threadId, turnId, reason = "superseded_by_new_turn") {
+  let removed = false;
+  const st = threads.get(threadId);
+  for (const [reqId, entry] of Array.from(pendingServerRequests.entries())) {
+    if (entry.threadId !== threadId) continue;
+    if (turnId !== null && entry.turnId !== turnId) continue;
+    entry.retired = true;
+    pendingServerRequests.delete(reqId);
+    removed = true;
+    // Respect single-reply authority: never send a second JSON-RPC reply if /respond already claimed it
+    if (!entry.replyClaimed && !entry.submitting) {
+      sendCancelReplyOnce(entry, `Request retired (${reason})`);
+    }
+    if (st) {
+      appendThreadLog(st, { kind: "server_request_retired", reqId, rpcId: entry.rpcId, turnId: entry.turnId, reason });
+    }
+  }
+  if (removed && st?.ownerConversationId) {
+    refreshConversationFlags(st.ownerConversationId);
+  }
+}
+
 function listPendingRequests(threadId = null) {
   const out = [];
   for (const r of pendingServerRequests.values()) {
+    if (r.retired) continue;
     if (threadId && r.threadId !== threadId) continue;
     out.push({
       reqId: r.reqId,
@@ -1441,6 +2230,7 @@ function listPendingRequests(threadId = null) {
       threadId: r.threadId,
       turnId: r.turnId,
       ownerGen: r.ownerGen,
+      isBlocking: r.isBlocking !== false,
       inboxRead: Boolean(r.inboxRead),
       submitting: Boolean(r.submitting),
       createdAt: r.createdAt,
@@ -1452,7 +2242,20 @@ function listPendingRequests(threadId = null) {
   return out;
 }
 
+function listPendingRequestsForTurn(threadId, turnId = null) {
+  return listPendingRequests(threadId).filter((r) => {
+    if (!turnId) return true;
+    return !r.turnId || r.turnId === turnId;
+  });
+}
+
+function listBlockingPendingRequestsForTurn(threadId, turnId = null) {
+  return listPendingRequestsForTurn(threadId, turnId).filter((r) => r.isBlocking !== false);
+}
+
 function buildCompactSummary(st) {
+  const nowMono = performance.now();
+  const diag = buildWatchdogDiagnostics(st, nowMono);
   return {
     threadId: st.threadId,
     ownerConversationId: st.ownerConversationId,
@@ -1465,6 +2268,15 @@ function buildCompactSummary(st) {
     status: st.status,
     activeTurnId: st.activeTurnId,
     lastTurnId: st.lastTurnId,
+    silentSec: diag.silentSec,
+    lastActivityTurnId: diag.lastActivityTurnId,
+    lastActivityKind: diag.lastActivityKind,
+    lastActivityAt: diag.lastActivityAt,
+    ...(diag.activeItems ? { activeItems: diag.activeItems } : {}),
+    ...(diag.activeItemsTotal !== undefined ? { activeItemsTotal: diag.activeItemsTotal } : {}),
+    ...(diag.activeItemsTruncated ? { activeItemsTruncated: true } : {}),
+    ...(diag.activeItemsApproximate ? { activeItemsApproximate: true } : {}),
+    ...(diag.lastNonRetryableError ? { lastNonRetryableError: diag.lastNonRetryableError } : {}),
     lastError: st.lastError,
     lastMessage: truncateText(st.lastMessage, 800),
     inFlightDraft: st.deltaBuffers.size > 0
@@ -1476,7 +2288,7 @@ function buildCompactSummary(st) {
     lastPlan: st.lastPlan,
     lastDiffStats: st.lastDiffStats,
     lastTokenUsage: st.turnTokenUsage || st.lastTokenUsage,
-    unackedNotificationsCount: st.hookNotifications.filter((n) => n.ownerGen === st.ownerGen).length,
+    unackedNotificationsCount: st.hookNotifications.filter((n) => n.ownerGen === st.ownerGen && !n.retired).length,
     unreportedOverflowCount: Math.max(0, st.overflowTotal - st.overflowAckedThrough),
     nextCursor: formatCursor(st.nextSeq - 1),
     logPath: st.logPath,
@@ -1487,10 +2299,19 @@ function buildCompactSummary(st) {
 function sendJsonRpcAsync(obj) {
   return new Promise((resolve, reject) => {
     if (!codexProc || !codexProc.stdin || codexProc.killed || codexProc.stdin.destroyed || !codexProc.stdin.writable) {
-      return reject(new Error("codex app-server stdin is not writable"));
+      const err = new Error("codex app-server stdin is not writable");
+      err.beforeWrite = true;
+      return reject(err);
+    }
+    let line;
+    try {
+      line = JSON.stringify(obj) + "\n";
+    } catch (err) {
+      err.beforeWrite = true;
+      return reject(err);
     }
     try {
-      codexProc.stdin.write(JSON.stringify(obj) + "\n", "utf8", (err) => {
+      codexProc.stdin.write(line, "utf8", (err) => {
         if (err) reject(err);
         else resolve();
       });
@@ -1549,6 +2370,82 @@ function trackRecentFile(st, fp) {
   }
 }
 
+function isTurnEndedOrSuperseded(st, turnId) {
+  if (!st || !turnId) return false;
+  return st.completedTurnIds.has(turnId) || st.supersededTurnIds.has(turnId);
+}
+
+function isCurrentTurnNotification(st, msgTurnId) {
+  if (!st || !msgTurnId || !st.activeTurnId) return false;
+  if (isTurnEndedOrSuperseded(st, msgTurnId)) return false;
+  return msgTurnId === st.activeTurnId;
+}
+
+function ensureTurnStarted(st, turnId, { source = "notification", emitEvent = false, expectedEpoch = null } = {}) {
+  if (!st) return false;
+  if (!turnId) {
+    if (st.activeTurnId) {
+      logDaemon(`Ignoring turn start without turnId while activeTurnId=${st.activeTurnId} (source=${source})`);
+    }
+    return false;
+  }
+  if (isTurnEndedOrSuperseded(st, turnId)) {
+    return false;
+  }
+  if (st.activeTurnId === turnId) {
+    if (emitEvent && !st.turnStartedEventEmitted.has(turnId)) {
+      addBoundedSet(st.turnStartedEventEmitted, turnId, MAX_TURN_HISTORY);
+      pushEvent(st.threadId, "info", "turn_started", turnId, { turnId });
+    }
+    return true;
+  }
+  // Never allow already-seen old turn notifications or server requests to resurrect a turn even when activeTurnId === null
+  if ((source === "notification" || source === "server_request") && st.startedTurnIds.has(turnId)) {
+    return false;
+  }
+  // Always enforce captured epoch for non-matching RPC turn/start results (even when activeTurnId === null)
+  if (source === "rpc" && expectedEpoch !== null && st.turnEpoch !== expectedEpoch) {
+    return false;
+  }
+  if (st.activeTurnId && st.activeTurnId !== turnId) {
+    if (source === "server_request") {
+      return false;
+    }
+    const oldTurnId = st.activeTurnId;
+    addBoundedSet(st.supersededTurnIds, oldTurnId, MAX_TURN_HISTORY);
+    retirePendingRequestsForTurn(st.threadId, oldTurnId, "superseded_by_new_turn");
+    retireTurnWatchdogNotifs(st, oldTurnId, Date.now(), performance.now(), { reschedule: false });
+    cancelWatchdogTimers(st, "cancelled", { reschedule: false });
+  }
+
+  st.turnEpoch += 1;
+  addBoundedSet(st.startedTurnIds, turnId, MAX_TURN_HISTORY);
+  st.activeTurnId = turnId;
+  st.lastTurnId = turnId;
+  st.status = "running";
+  st.lastError = null;
+  st.lastMessage = "";
+  st.lastMessageTurnId = turnId;
+  st.lastPhase = null;
+  st.turnTokenUsage = null;
+  st.deltaBuffers.clear();
+  st.pendingFileChanges.clear();
+  st.turnFiles.clear();
+  st.turnCommands = [];
+  clearTurnActivityContainers(st);
+  resetWatchdogState(st, "cancelled", { reschedule: false });
+
+  const nowMono = performance.now();
+  st.lastProgressKind = "turn/started";
+  onTurnEnteredRunning(st, nowMono, { creditContact: true });
+
+  if (emitEvent && !st.turnStartedEventEmitted.has(turnId)) {
+    addBoundedSet(st.turnStartedEventEmitted, turnId, MAX_TURN_HISTORY);
+    pushEvent(st.threadId, "info", "turn_started", turnId, { turnId });
+  }
+  return true;
+}
+
 function handleServerNotification(msg) {
   const method = msg.method;
   const p = msg.params || {};
@@ -1559,6 +2456,8 @@ function handleServerNotification(msg) {
     let removedEntry = null;
     for (const [reqId, entry] of pendingServerRequests.entries()) {
       if (entry.rpcId === reqRpcId && (!p.threadId || entry.threadId === p.threadId)) {
+        entry.resolvedByServer = true;
+        entry.replyClaimed = true;
         pendingServerRequests.delete(reqId);
         removedEntry = entry;
         break;
@@ -1566,8 +2465,18 @@ function handleServerNotification(msg) {
     }
     if (removedEntry) {
       const st = getThreadState(removedEntry.threadId);
-      if (listPendingRequests(removedEntry.threadId).length === 0 && st.activeTurnId) {
+      if (
+        st.status === "waiting_input" &&
+        st.activeTurnId &&
+        listBlockingPendingRequestsForTurn(st.threadId, st.activeTurnId).length === 0
+      ) {
         st.status = "running";
+        // Only credit supervisor contact here if /respond write ALREADY succeeded before serverRequest/resolved arrived
+        const creditContact = Boolean(
+          removedEntry.writeConfirmed && removedEntry.turnId && removedEntry.turnId === st.activeTurnId
+        );
+        st.lastProgressKind = creditContact ? "supervisor:responded" : "serverRequest/resolved";
+        onTurnEnteredRunning(st, performance.now(), { creditContact });
       }
       appendThreadLog(st, { kind: "server_request_resolved_by_server", reqId: removedEntry.reqId, rpcId: reqRpcId });
       if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
@@ -1578,43 +2487,122 @@ function handleServerNotification(msg) {
   if (method === "turn/started" && threadId) {
     const st = getThreadState(threadId);
     const turnId = p.turn?.id || p.turnId || null;
-    st.activeTurnId = turnId;
-    st.lastTurnId = turnId || st.lastTurnId;
-    st.status = "running";
-    st.lastError = null;
-    st.lastMessage = "";
-    st.lastMessageTurnId = turnId;
-    st.lastPhase = null;
-    st.turnTokenUsage = null;
-    st.deltaBuffers.clear();
-    st.pendingFileChanges.clear();
-    st.turnFiles.clear();
-    st.turnCommands = [];
-    pushEvent(threadId, "info", "turn_started", turnId, { turnId });
+    ensureTurnStarted(st, turnId, { source: "notification", emitEvent: true });
     return;
   }
 
   if (method === "item/started" && threadId) {
     const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
     const item = p.item || {};
     if (item.type === "fileChange" && item.id) {
       st.pendingFileChanges.set(item.id, summarizeFileChanges(item.changes));
+    }
+    if (item.id) {
+      if (!st.completedItemIds.has(item.id) && !st.activeItems.has(item.id)) {
+        const normType = normalizeActiveItemType(item.type);
+        if (st.activeItems.size < MAX_ACTIVE_ITEMS) {
+          st.activeItems.set(item.id, { type: normType, startedMonoMs: performance.now() });
+        } else {
+          st.activeItemsOverflowed = true;
+        }
+        recordTurnProgress(st, turnId, `item/started:${normType}`);
+      }
     }
     return;
   }
 
   if (method === "item/agentMessage/delta" && threadId) {
     const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    const delta = typeof p.delta === "string" ? p.delta : "";
     const itemId = p.itemId || "_default";
-    st.deltaBuffers.set(itemId, (st.deltaBuffers.get(itemId) || "") + (p.delta || ""));
-    st.updatedAt = Date.now();
+    if (delta.length > 0) {
+      st.deltaBuffers.set(itemId, (st.deltaBuffers.get(itemId) || "") + delta);
+      recordTurnProgress(st, turnId, "item/agentMessage/delta");
+    }
+    return;
+  }
+
+  if (
+    (method === "item/commandExecution/outputDelta" ||
+      method === "item/plan/delta" ||
+      method === "item/reasoning/summaryTextDelta" ||
+      method === "item/reasoning/textDelta") &&
+    threadId
+  ) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    if (typeof p.delta === "string" && p.delta.length > 0) {
+      recordTurnProgress(st, turnId, method);
+    }
+    return;
+  }
+
+  if (method === "item/reasoning/summaryPartAdded" && threadId) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    const key = `${p.itemId || ""}:${p.summaryIndex ?? ""}`;
+    if (addBoundedSet(st.seenReasoningParts, key, MAX_SEEN_DEDUP)) {
+      recordTurnProgress(st, turnId, method);
+    }
+    return;
+  }
+
+  if (method === "item/mcpToolCall/progress" && threadId) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    if (typeof p.message === "string" && p.message.length > 0) {
+      recordTurnProgress(st, turnId, method);
+    }
+    return;
+  }
+
+  if (method === "item/fileChange/patchUpdated" && threadId) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    if (Array.isArray(p.changes) && p.changes.length > 0) {
+      const digest = digestPatchChanges(p.changes);
+      const key = String(p.itemId || "_default");
+      if (st.lastPatchDigests.get(key) !== digest) {
+        setBoundedMap(st.lastPatchDigests, key, digest, MAX_PATCH_DIGESTS);
+        recordTurnProgress(st, turnId, method);
+      }
+    }
+    return;
+  }
+
+  if ((method === "item/autoApprovalReview/started" || method === "item/autoApprovalReview/completed") && threadId) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    const phase = method.endsWith("started") ? "started" : "completed";
+    if (p.reviewId && addBoundedSet(st.seenAutoApprovalReviews, `${p.reviewId}:${phase}`, MAX_SEEN_DEDUP)) {
+      recordTurnProgress(st, turnId, method);
+    }
     return;
   }
 
   if (method === "item/completed" && threadId) {
     const st = getThreadState(threadId);
     const item = p.item || {};
-    const turnId = p.turnId || st.activeTurnId;
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+
+    // Remove from activeItems & mark tombstone BEFORE any item.type branch (including message_supervisor early return)
+    if (item.id) {
+      const wasActive = st.activeItems.delete(item.id);
+      const firstCompleted = addBoundedSet(st.completedItemIds, item.id, MAX_COMPLETED_ITEM_IDS);
+      if (firstCompleted || wasActive) {
+        recordTurnProgress(st, turnId, `item/completed:${normalizeActiveItemType(item.type)}`);
+      }
+    }
 
     if (item.type === "agentMessage") {
       const text = item.text || st.deltaBuffers.get(item.id) || "";
@@ -1744,13 +2732,23 @@ function handleServerNotification(msg) {
 
   if (method === "turn/plan/updated" && threadId) {
     const st = getThreadState(threadId);
-    st.lastPlan = { explanation: p.explanation || null, plan: p.plan || [] };
-    pushEvent(threadId, "milestone", "plan_updated", p.turnId, st.lastPlan);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
+    const planPayload = { explanation: p.explanation || null, plan: p.plan || [] };
+    st.lastPlan = planPayload;
+    const digest = digestPlanUpdate(planPayload.explanation, planPayload.plan);
+    if (digest !== st.lastPlanDigest) {
+      st.lastPlanDigest = digest;
+      recordTurnProgress(st, turnId, "turn/plan/updated");
+    }
+    pushEvent(threadId, "milestone", "plan_updated", turnId, st.lastPlan);
     return;
   }
 
   if (method === "turn/diff/updated" && threadId) {
     const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    if (!isCurrentTurnNotification(st, turnId)) return;
     const diff = typeof p.diff === "string" ? p.diff : "";
     const files = [];
     for (const line of diff.split(/\r?\n/)) {
@@ -1761,59 +2759,111 @@ function handleServerNotification(msg) {
       trackRecentFile(st, f);
     }
     st.lastDiffStats = { files, bytes: diff.length };
+    const digest = boundedStringEdgeDigest(diff, 32768);
+    if (digest !== st.lastDiffDigest) {
+      st.lastDiffDigest = digest;
+      recordTurnProgress(st, turnId, "turn/diff/updated");
+    }
     return;
   }
 
   if (method === "thread/tokenUsage/updated" && threadId) {
     const st = getThreadState(threadId);
     st.lastTokenUsage = p;
-    st.turnTokenUsage = p;
+    if (!p.turnId || p.turnId === st.activeTurnId) {
+      st.turnTokenUsage = p;
+    }
+    return;
+  }
+
+  if (method === "error" && threadId) {
+    const st = getThreadState(threadId);
+    const turnId = p.turnId || null;
+    // willRetry: true is ignored (never extends stall); willRetry: false records sanitized enum without extending stall
+    if (p.willRetry === false && isCurrentTurnNotification(st, turnId)) {
+      st.lastNonRetryableError = {
+        code: classifyNonRetryableErrorCode(p.error),
+        observedAt: new Date().toISOString(),
+        turnId,
+      };
+    }
     return;
   }
 
   if (method === "turn/completed" && threadId) {
     const st = getThreadState(threadId);
     const turn = p.turn || {};
-    const turnId = turn.id || p.turnId || st.activeTurnId;
+    const turnId = turn.id || p.turnId || null;
     const status = turn.status || "completed";
-    if (turnId) {
-      st.completedTurnIds.add(turnId);
-      if (st.completedTurnIds.size > 100) {
-        const first = st.completedTurnIds.values().next().value;
-        st.completedTurnIds.delete(first);
-      }
+
+    if (!turnId && st.activeTurnId) {
+      logDaemon(`Ignoring turn/completed without turnId while activeTurnId=${st.activeTurnId}`);
+      return;
     }
-    prunePendingRequestsForThread(threadId, turnId);
+    if (turnId && st.completedTurnIds.has(turnId)) {
+      return;
+    }
+    if (turnId && st.supersededTurnIds.has(turnId)) {
+      addBoundedSet(st.completedTurnIds, turnId, MAX_TURN_HISTORY);
+      prunePendingRequestsForThread(threadId, turnId);
+      retireTurnWatchdogNotifs(st, turnId, Date.now(), performance.now(), { reschedule: false });
+      return;
+    }
+    if (turnId && st.activeTurnId && turnId !== st.activeTurnId) {
+      addBoundedSet(st.completedTurnIds, turnId, MAX_TURN_HISTORY);
+      prunePendingRequestsForThread(threadId, turnId);
+      retireTurnWatchdogNotifs(st, turnId);
+      return;
+    }
+
+    if (turnId) {
+      addBoundedSet(st.completedTurnIds, turnId, MAX_TURN_HISTORY);
+    }
+    // P0: Commit terminal state & run side-effect-free cleanup BEFORE publishing turn_completed/turn_error
+    // so cancelling an in-flight receipt NEVER synchronously fires stall on another waiter before terminal delivery!
+    const isFailed = status === "failed" || Boolean(turn.error);
+    const turnMessage = st.lastMessageTurnId === turnId ? st.lastMessage : "";
+    const turnFilesSnap = Array.from(st.turnFiles);
+    const turnCommandsCountSnap = st.turnCommands.length;
+    const recentCommandsSnap = st.turnCommands.slice(-5);
+    const turnTokenUsageSnap = st.turnTokenUsage;
+
     st.activeTurnId = null;
     st.lastTurnId = turnId || st.lastTurnId;
+    st.status = isFailed ? "error" : "idle";
+    if (isFailed) {
+      st.lastError = turn.error || { message: `turn ${status}` };
+    }
     st.deltaBuffers.clear();
     st.pendingFileChanges.clear();
+    clearTurnActivityContainers(st);
+    prunePendingRequestsForThread(threadId, turnId);
+    retireTurnWatchdogNotifs(st, turnId, Date.now(), performance.now(), { reschedule: false });
+    cancelWatchdogTimers(st, "cancelled", { reschedule: false });
 
-    // Only attach message/token usage belonging to THIS turn (avoid leaking prior turn on fast failure)
-    const turnMessage = st.lastMessageTurnId === turnId ? st.lastMessage : "";
-    if (status === "failed" || turn.error) {
-      st.status = "error";
-      st.lastError = turn.error || { message: `turn ${status}` };
+    if (isFailed) {
       pushEvent(threadId, "critical", "turn_error", turnId, {
         status,
         error: st.lastError,
         lastMessage: truncateText(turnMessage, MAX_INLINE_TEXT),
-        turnFiles: Array.from(st.turnFiles),
-        turnCommandsCount: st.turnCommands.length,
+        turnFiles: turnFilesSnap,
+        turnCommandsCount: turnCommandsCountSnap,
         logPath: st.logPath,
       });
     } else {
-      st.status = "idle";
       pushEvent(threadId, "critical", "turn_completed", turnId, {
         status,
         lastMessage: truncateText(turnMessage, MAX_INLINE_TEXT),
-        turnFiles: Array.from(st.turnFiles),
-        turnCommandsCount: st.turnCommands.length,
-        recentCommands: st.turnCommands.slice(-5),
-        tokenUsage: st.turnTokenUsage,
+        turnFiles: turnFilesSnap,
+        turnCommandsCount: turnCommandsCountSnap,
+        recentCommands: recentCommandsSnap,
+        tokenUsage: turnTokenUsageSnap,
         logPath: st.logPath,
       });
     }
+    // Reschedule any remaining waiters (e.g., ahead-of-head or non-matching) after terminal state is committed
+    rescheduleWaiters(st);
+    rescheduleBgWatchdog(st);
     return;
   }
 
@@ -1901,7 +2951,17 @@ function handleServerRequest(msg) {
     const validWait = rawWait === undefined || typeof rawWait === "boolean";
     const waitForReply = rawWait === true;
     const threadId = p.threadId || "unknown";
-    const turnId = p.turnId || null;
+    const turnId = typeof p.turnId === "string" && p.turnId.trim() ? p.turnId.trim() : null;
+
+    if (!turnId) {
+      logDaemon(`Rejecting item/tool/call without turnId rpcId=${msg.id}`);
+      sendJsonRpcAsync({
+        jsonrpc: "2.0",
+        id: msg.id,
+        error: { code: -32602, message: "Invalid params: turnId required" },
+      }).catch((e) => logDaemon(`Failed to reject missing-turnId tool call: ${e.message}`));
+      return;
+    }
 
     if (!isPlainObj || !text || !validWait) {
       sendJsonRpcAsync({
@@ -1916,6 +2976,22 @@ function handleServerRequest(msg) {
     }
 
     const st = getThreadState(threadId);
+    if (isTurnEndedOrSuperseded(st, turnId) || (st.activeTurnId && turnId !== st.activeTurnId) || (!st.activeTurnId && st.startedTurnIds.has(turnId))) {
+      appendThreadLog(st, { kind: "server_request_rejected_stale", method, rpcId: msg.id, turnId, activeTurnId: st.activeTurnId });
+      sendJsonRpcAsync({
+        jsonrpc: "2.0",
+        id: msg.id,
+        result: {
+          success: false,
+          contentItems: [{ type: "inputText", text: "Stale turn request rejected" }],
+        },
+      }).catch((e) => logDaemon(`Failed to reject stale message_supervisor call: ${e.message}`));
+      return;
+    }
+    if (!st.activeTurnId) {
+      ensureTurnStarted(st, turnId, { source: "server_request", emitEvent: false });
+    }
+
     appendThreadLog(st, { kind: "message_supervisor_call", turnId, waitForReply, message: text });
 
     if (!waitForReply) {
@@ -1929,6 +3005,7 @@ function handleServerRequest(msg) {
         },
       }).catch((e) => logDaemon(`Failed to ack non-blocking message_supervisor: ${e.message}`));
 
+      recordTurnProgress(st, turnId, "tool:message_supervisor");
       pushEvent(threadId, "critical", "supervisor_message", turnId, {
         message: truncateText(text, MAX_INLINE_TEXT),
         truncated: text.length > MAX_INLINE_TEXT,
@@ -1945,6 +3022,11 @@ function handleServerRequest(msg) {
       threadId,
       turnId,
       ownerGen: st.ownerGen,
+      isBlocking: true,
+      replyClaimed: false,
+      writeConfirmed: false,
+      resolvedByServer: false,
+      retired: false,
       eventSeq: 0,
       inboxRead: false,
       submitting: false,
@@ -1954,6 +3036,7 @@ function handleServerRequest(msg) {
     };
     pendingServerRequests.set(reqId, qEntry);
     st.status = "waiting_input";
+    rescheduleBgWatchdog(st);
     const qEv = pushEvent(threadId, "critical", "supervisor_question", turnId, {
       reqId,
       message: truncateText(text, MAX_INLINE_TEXT),
@@ -1968,10 +3051,35 @@ function handleServerRequest(msg) {
     threadId = p.conversationId;
   }
   if (!threadId) threadId = p.conversationId || "unknown";
-  const turnId = p.turnId || null;
-  const reqId = `${INSTANCE_ID}:${serverReqNextSeq++}`;
-
+  const isLegacyApproval = method === "applyPatchApproval" || method === "execCommandApproval";
+  const reqTurnId = typeof p.turnId === "string" && p.turnId.trim() ? p.turnId.trim() : null;
   const st = getThreadState(threadId);
+
+  if (!reqTurnId && (!isLegacyApproval || !st.activeTurnId)) {
+    logDaemon(`Rejecting ${method} without turnId rpcId=${msg.id}`);
+    sendJsonRpcAsync({
+      jsonrpc: "2.0",
+      id: msg.id,
+      error: { code: -32602, message: "Invalid params: turnId required" },
+    }).catch((e) => logDaemon(`Failed to reject missing-turnId request: ${e.message}`));
+    return;
+  }
+
+  const effTurnId = reqTurnId || st.activeTurnId;
+  if (
+    isTurnEndedOrSuperseded(st, effTurnId) ||
+    (st.activeTurnId && effTurnId !== st.activeTurnId) ||
+    (!st.activeTurnId && st.startedTurnIds.has(effTurnId))
+  ) {
+    appendThreadLog(st, { kind: "server_request_rejected_stale", method, rpcId: msg.id, turnId: effTurnId, activeTurnId: st.activeTurnId });
+    sendCancelReplyOnce({ rpcId: msg.id, method, params: p, replyClaimed: false }, "Stale turn request rejected");
+    return;
+  }
+  if (!st.activeTurnId) {
+    ensureTurnStarted(st, effTurnId, { source: "server_request", emitEvent: false });
+  }
+
+  const reqId = `${INSTANCE_ID}:${serverReqNextSeq++}`;
   let preview = null;
   if (method === "item/fileChange/requestApproval" && p.itemId) {
     preview = st.pendingFileChanges.get(p.itemId) || null;
@@ -1979,13 +3087,20 @@ function handleServerRequest(msg) {
     preview = Object.keys(p.fileChanges).slice(0, 20);
   }
 
+  const isUserInput = method === "item/tool/requestUserInput";
+  const isBlocking = isUserInput ? p.isBlocking !== false : true;
   const entry = {
     reqId,
     rpcId: msg.id,
     method,
     threadId,
-    turnId,
+    turnId: effTurnId,
     ownerGen: st.ownerGen,
+    isBlocking,
+    replyClaimed: false,
+    writeConfirmed: false,
+    resolvedByServer: false,
+    retired: false,
     eventSeq: 0,
     inboxRead: false,
     submitting: false,
@@ -1994,14 +3109,16 @@ function handleServerRequest(msg) {
     createdAt: new Date().toISOString(),
   };
   pendingServerRequests.set(reqId, entry);
-  st.status = "waiting_input";
+  if (isBlocking) {
+    st.status = "waiting_input";
+    rescheduleBgWatchdog(st);
+  }
 
-  const isUserInput = method === "item/tool/requestUserInput";
   const reqEv = pushEvent(
     threadId,
     "critical",
     isUserInput ? "user_input_request" : "approval_request",
-    turnId,
+    effTurnId,
     {
       reqId,
       method,
@@ -2023,14 +3140,38 @@ function failAllPendingAndWaiters(reason) {
     reject(new Error(reason));
   }
   pendingRpc.clear();
+  for (const r of pendingServerRequests.values()) {
+    r.retired = true;
+    r.replyClaimed = true;
+  }
   pendingServerRequests.clear();
+
+  const now = Date.now();
+  const nowMono = performance.now();
+  const activeToNotify = [];
+
+  // Phase 1 (P0): Commit disconnected state & run side-effect-free cleanup on ALL threads FIRST
+  // so Phase 2 batch issuance / global pruning on Thread A can NEVER fire stall on Thread B!
   for (const st of threads.values()) {
-    if (st.status === "running" || st.status === "waiting_input" || st.waiters.size > 0) {
+    const wasActive = st.status === "running" || st.status === "waiting_input" || st.waiters.size > 0;
+    if (wasActive) {
       st.status = "error";
       st.activeTurnId = null;
       st.lastError = { message: reason };
-      pushEvent(st.threadId, "critical", "daemon_error", st.lastTurnId, st.lastError);
-    } else if (st.ownerConversationId) {
+      activeToNotify.push(st);
+    }
+    retireTurnWatchdogNotifs(st, null, now, nowMono, { reschedule: false });
+    cancelWatchdogTimers(st, "cancelled", { reschedule: false });
+    clearTurnActivityContainers(st);
+  }
+
+  // Phase 2: Publish daemon_error to all affected threads and reschedule any remaining waiters
+  for (const st of activeToNotify) {
+    pushEvent(st.threadId, "critical", "daemon_error", st.lastTurnId, st.lastError);
+    rescheduleWaiters(st);
+  }
+  for (const st of threads.values()) {
+    if (!activeToNotify.includes(st) && st.ownerConversationId) {
       refreshConversationFlags(st.ownerConversationId);
     }
   }
@@ -2164,13 +3305,9 @@ function makeTextInput(prompt) {
   return [{ type: "text", text: prompt }];
 }
 
-function markTurnStartedIfNotFinished(st, turnId) {
+function markTurnStartedIfNotFinished(st, turnId, expectedEpoch = null) {
   if (!turnId) return;
-  st.lastTurnId = turnId;
-  if (!st.completedTurnIds.has(turnId)) {
-    st.activeTurnId = turnId;
-    if (st.status !== "waiting_input") st.status = "running";
-  }
+  ensureTurnStarted(st, turnId, { source: "rpc", emitEvent: false, expectedEpoch });
 }
 
 function isNoActiveTurnError(err) {
@@ -2349,9 +3486,9 @@ function handleHookPoll(body) {
     let threadHasStopItem = false;
 
     for (const n of st.hookNotifications) {
-      if (n.ownerGen !== st.ownerGen) continue;
+      if (n.ownerGen !== st.ownerGen || n.retired) continue;
       if (n.leaseBatchId && now < n.leaseUntil) continue;
-      if (hasEligibleWaiterForEvent(st, n.seq, "critical")) continue;
+      if (!n.inboxOnly && hasEligibleWaiterForEvent(st, n.seq, "critical")) continue;
       claimableNotifCount++;
       threadHasPreItem = true;
       threadHasStopItem = true;
@@ -2366,7 +3503,8 @@ function handleHookPoll(body) {
     }
 
     for (const r of pendingServerRequests.values()) {
-      if (r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (r.retired || r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (st.activeTurnId && r.turnId && r.turnId !== st.activeTurnId) continue;
       if (hasEligibleWaiterForPending(st, r)) continue;
       unresolvedPendingCount++;
       threadHasStopItem = true;
@@ -2446,7 +3584,8 @@ function buildMinimalPendingSummary(r, st) {
 
 function handleInboxRead(body) {
   const now = Date.now();
-  pruneExpiredBatchesAndNotifications(now);
+  const nowMono = performance.now();
+  pruneExpiredBatchesAndNotifications(now, nowMono);
 
   const reqConvId = parseOptionalConversationId(body.conversationId);
   const reqThreadId = typeof body.threadId === "string" && body.threadId.trim() ? body.threadId.trim() : null;
@@ -2492,11 +3631,11 @@ function handleInboxRead(body) {
     threadsMeta: {},
   };
 
-  const candidatesByThread = new Map(); // threadId -> { st, notifIds, pendingReqIds, includeOverflow }
+  const candidatesByThread = new Map(); // threadId -> { st, notifIds, pendingReqIds, overflowThrough }
   const ensureCandidate = (st) => {
     let c = candidatesByThread.get(st.threadId);
     if (!c) {
-      c = { st, notifIds: [], pendingReqIds: [], includeOverflow: false };
+      c = { st, notifIds: [], pendingReqIds: [], overflowThrough: 0 };
       candidatesByThread.set(st.threadId, c);
     }
     return c;
@@ -2515,6 +3654,9 @@ function handleInboxRead(body) {
     if (!hadMeta) {
       out.threadsMeta[st.threadId] = {
         status: st.status,
+        activeTurnId: st.activeTurnId,
+        silentSec: computeSilentSec(st, nowMono),
+        lastActivityKind: st.lastProgressKind,
         nextCursor: formatCursor(st.nextSeq - 1),
         logPath: st.logPath,
       };
@@ -2535,12 +3677,13 @@ function handleInboxRead(body) {
   const readPendingList = [];
   for (const st of selectedThreads) {
     for (const n of st.hookNotifications) {
-      if (n.ownerGen === st.ownerGen && n.leaseBatchId && now < n.leaseUntil) {
+      if (n.ownerGen === st.ownerGen && !n.retired && n.leaseBatchId && now < n.leaseUntil) {
         out.inFlightLeasedCount++;
       }
     }
     for (const r of pendingServerRequests.values()) {
-      if (r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (r.retired || r.threadId !== st.threadId || r.ownerGen !== st.ownerGen) continue;
+      if (st.activeTurnId && r.turnId && r.turnId !== st.activeTurnId) continue;
       if (r.inboxRead) readPendingList.push({ st, r });
       else unreadPendingList.push({ st, r });
     }
@@ -2585,7 +3728,7 @@ function handleInboxRead(body) {
       () => out.overflows.pop()
     );
     if (added) {
-      ensureCandidate(st).includeOverflow = true;
+      ensureCandidate(st).overflowThrough = ovObj.overflowThrough;
     } else {
       out.hasMore = true;
       if (Object.keys(out.threadsMeta).length < INBOX_MAX_THREADS) break;
@@ -2596,7 +3739,7 @@ function handleInboxRead(body) {
   const queues = [];
   for (const st of selectedThreads) {
     const claimable = st.hookNotifications.filter(
-      (n) => n.ownerGen === st.ownerGen && (!n.leaseBatchId || now >= n.leaseUntil)
+      (n) => n.ownerGen === st.ownerGen && !n.retired && (!n.leaseBatchId || now >= n.leaseUntil)
     );
     if (claimable.length > 0) {
       queues.push({ st, list: claimable, idx: 0 });
@@ -2635,17 +3778,30 @@ function handleInboxRead(body) {
       }
       if (out.items.length === 0) {
         // Single oversized item: try minimal truncated summary and STILL verify BYTE_BUDGET
-        const truncObj = {
-          notifId: n.notifId,
-          threadId: q.st.threadId,
-          seq: n.seq,
-          kind: n.kind,
-          turnId: n.turnId,
-          ...(n.data?.message ? { message: truncateText(n.data.message, 300) } : {}),
-          ...(n.data?.error ? { error: truncateText(n.data.error, 300) } : {}),
-          truncated: true,
-          logPath: q.st.logPath,
-        };
+        const truncObj =
+          n.kind === "turn_watchdog"
+            ? {
+                notifId: n.notifId,
+                threadId: q.st.threadId,
+                seq: null,
+                kind: "turn_watchdog",
+                turnId: n.turnId,
+                timeoutReason: n.data?.timeoutReason || "stall",
+                observedAt: n.data?.observedAt || null,
+                truncated: true,
+                logPath: q.st.logPath,
+              }
+            : {
+                notifId: n.notifId,
+                threadId: q.st.threadId,
+                seq: n.seq,
+                kind: n.kind,
+                turnId: n.turnId,
+                ...(n.data?.message ? { message: truncateText(n.data.message, 300) } : {}),
+                ...(n.data?.error ? { error: truncateText(n.data.error, 300) } : {}),
+                truncated: true,
+                logPath: q.st.logPath,
+              };
         const addedTrunc = tryCommit(
           q.st,
           () => out.items.push(truncObj),
@@ -2697,7 +3853,8 @@ function handleInboxRead(body) {
   }
 
   const effectiveConvId = reqConvId;
-  const batch = issueAckBatch(effectiveConvId, Array.from(candidatesByThread.values()), now);
+  // Pass skipPrune: true so batch issuance uses the exact snapshot already pruned & rendered above
+  const batch = issueAckBatch(effectiveConvId, Array.from(candidatesByThread.values()), now, { skipPrune: true });
   if (batch) {
     out.batchId = batch.batchId;
     out.expiresAt = batch.expiresAt;
@@ -2708,7 +3865,7 @@ function handleInboxRead(body) {
 
 function handleInboxAck(body) {
   const now = Date.now();
-  pruneExpiredBatchesAndNotifications(now);
+  const nowMono = performance.now();
 
   const batchId = typeof body.batchId === "string" ? body.batchId.trim() : "";
   if (!batchId) {
@@ -2718,8 +3875,27 @@ function handleInboxAck(body) {
   }
 
   const reqConvId = parseOptionalConversationId(body.conversationId);
+  const directBatch = activeBatches.get(batchId);
+
+  // Foreground timeout receipt batch: decide win/loss against the single monotonic deadline
+  if (directBatch && directBatch.kind === "fg_timeout_receipt") {
+    if ((reqConvId ?? null) !== (directBatch.conversationId ?? null)) {
+      const err = new Error("Conversation mismatch for batchId");
+      err.statusCode = 403;
+      throw err;
+    }
+    if (nowMono >= directBatch.expiresAtMonoMs) {
+      settleFgTimeoutReceipt(batchId, "expired", nowMono);
+      return { ok: true, applied: 0, expired: true };
+    }
+    const settled = settleFgTimeoutReceipt(batchId, "acked", nowMono);
+    return { ok: true, applied: settled ? 1 : 0, expired: !settled };
+  }
+
+  pruneExpiredBatchesAndNotifications(now, nowMono);
+
   const batch = activeBatches.get(batchId);
-  if (!batch) {
+  if (!batch || batch.kind === "fg_timeout_receipt") {
     return { ok: true, applied: 0, expired: true };
   }
 
@@ -2733,6 +3909,8 @@ function handleInboxAck(body) {
   activeBatches.delete(batchId);
   let applied = 0;
   const affectedConvs = new Set();
+  const bgRescheduleThreads = new Set();
+  const fgRescheduleThreads = new Set();
 
   for (const entry of batch.entries) {
     const st = threads.get(entry.threadId);
@@ -2744,8 +3922,22 @@ function handleInboxAck(body) {
         const n = st.hookNotifications[i];
         // Late B1 ACK never touches B2 because leaseBatchId must match batchId strictly
         if (n.ownerGen === entry.ownerGen && idSet.has(n.notifId) && n.leaseBatchId === batchId) {
-          st.hookNotifications.splice(i, 1);
+          const [removed] = st.hookNotifications.splice(i, 1);
           applied++;
+          if (removed.kind === "turn_watchdog") {
+            if (onHookNotifRemoved(st, removed, { reason: "ack", nowMono })) {
+              fgRescheduleThreads.add(st);
+              bgRescheduleThreads.add(st);
+            }
+          } else if (
+            removed.ownerGen === st.ownerGen &&
+            removed.turnId &&
+            removed.turnId === st.activeTurnId &&
+            st.status === "running"
+          ) {
+            st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+            bgRescheduleThreads.add(st);
+          }
         }
       }
     }
@@ -2757,10 +3949,14 @@ function handleInboxAck(body) {
 
     for (const reqId of entry.pendingReqIds) {
       const r = pendingServerRequests.get(reqId);
-      if (r && r.threadId === entry.threadId && r.ownerGen === entry.ownerGen) {
+      if (r && !r.retired && r.threadId === entry.threadId && r.ownerGen === entry.ownerGen) {
         if (!r.inboxRead) {
           r.inboxRead = true;
           applied++;
+          if (r.turnId && r.turnId === st.activeTurnId) {
+            st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+            bgRescheduleThreads.add(st);
+          }
         }
       }
     }
@@ -2769,6 +3965,8 @@ function handleInboxAck(body) {
   }
 
   for (const c of affectedConvs) refreshConversationFlags(c);
+  for (const st of fgRescheduleThreads) rescheduleWaiters(st);
+  for (const st of bgRescheduleThreads) rescheduleBgWatchdog(st);
   return { ok: true, applied, expired: false };
 }
 
@@ -2781,7 +3979,7 @@ async function handleApi(req, res) {
       pid: process.pid,
       instanceId: INSTANCE_ID,
       protocolVersion: PROTOCOL_VERSION,
-      capabilities: { hookPoll: true, inbox: true },
+      capabilities: { hookPoll: true, inbox: true, stallWatchdog: true },
       codexBin,
       codexInitInfo,
       activeThreads: Array.from(threads.values()).filter((t) => t.status === "running" || t.status === "waiting_input").length,
@@ -2914,9 +4112,10 @@ async function handleApi(req, res) {
           if (body.cwd) turnParams.cwd = body.cwd;
           if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
           applyCollaborationMode(turnParams, body, st);
+          const expectedEpoch = st.turnEpoch;
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId);
+          markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
           if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
@@ -2998,6 +4197,7 @@ async function handleApi(req, res) {
             ) {
               st.ownerConversationId = reqConvId;
               st.ownerGen = nextOwnerGen++;
+              resetWatchdogState(st, "cancelled");
               setThreadOwnerRecord(st.threadId, st.ownerConversationId, st.ownerGen);
               // Atomically migrate any live unowned requests/notifications to the new ownerGen
               for (const r of pendingServerRequests.values()) {
@@ -3023,7 +4223,7 @@ async function handleApi(req, res) {
               reasons.push(`status=${st.status}`);
             }
             if (listPendingRequests(st.threadId).length > 0) reasons.push("pending_requests");
-            if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen)) reasons.push("unacked_notifications");
+            if (st.hookNotifications.some((n) => n.ownerGen === st.ownerGen && !n.retired)) reasons.push("unacked_notifications");
             if (st.overflowTotal > st.overflowAckedThrough) reasons.push("unreported_overflow");
             if (hasActiveBatchForThread(st.threadId)) reasons.push("active_batch");
             if (Array.from(st.waiters).some((w) => isEligibleWaiterBase(st, w))) reasons.push("active_owner_waiter");
@@ -3035,6 +4235,7 @@ async function handleApi(req, res) {
             const oldOwner = st.ownerConversationId;
             st.ownerConversationId = reqConvId;
             st.ownerGen = nextOwnerGen++;
+            resetWatchdogState(st, "cancelled");
             st.hookNotifications = [];
             st.overflowTotal = 0;
             st.overflowAckedThrough = 0;
@@ -3066,9 +4267,10 @@ async function handleApi(req, res) {
           if (body.model) turnParams.model = body.model;
           if (body.effort) turnParams.effort = body.effort;
           applyCollaborationMode(turnParams, body, st);
+          const expectedEpoch = st.turnEpoch;
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId);
+          markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
           if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
@@ -3165,9 +4367,10 @@ async function handleApi(req, res) {
           if (body.effort) turnParams.effort = body.effort;
           try {
             applyCollaborationMode(turnParams, body, st);
+            const expectedEpoch = st.turnEpoch;
             const tRes = await rpcCall("turn/start", turnParams);
             turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
+            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
@@ -3217,9 +4420,10 @@ async function handleApi(req, res) {
         if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
         applyCollaborationMode(turnParams, body, st);
 
+        const expectedEpoch = st.turnEpoch;
         const tRes = await rpcCall("turn/start", turnParams);
         const turnId = tRes.turn?.id || tRes.turnId || null;
-        markTurnStartedIfNotFinished(st, turnId);
+        markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
         if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
         appendThreadLog(st, {
           kind: "supervisor_prompt",
@@ -3260,12 +4464,13 @@ async function handleApi(req, res) {
         if (!expectedTurnId) {
           if (body.fallbackSend && !explicitTurnId) {
             const cursorBefore = st.nextSeq - 1;
+            const expectedEpoch = st.turnEpoch;
             const tRes = await rpcCall("turn/start", {
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
+            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
@@ -3296,6 +4501,13 @@ async function handleApi(req, res) {
             input: makeTextInput(body.prompt),
           });
           appendThreadLog(st, { kind: "steer_sent", turnId: expectedTurnId, prompt: body.prompt });
+          // Re-verify active turn & running state after await before crediting clocks
+          if (st.activeTurnId === expectedTurnId && st.status === "running") {
+            const nowMono = performance.now();
+            recordTurnProgress(st, expectedTurnId, "supervisor:steer", nowMono);
+            st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+            rescheduleBgWatchdog(st);
+          }
           return {
             mode: "steered",
             instanceId: INSTANCE_ID,
@@ -3308,12 +4520,13 @@ async function handleApi(req, res) {
           // and the RPC error explicitly indicates no active turn (never on timeout or turn mismatch).
           if (body.fallbackSend && !explicitTurnId && !st.activeTurnId && isNoActiveTurnError(err)) {
             const fbCursorBefore = st.nextSeq - 1;
+            const expectedEpoch = st.turnEpoch;
             const tRes = await rpcCall("turn/start", {
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
+            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
@@ -3360,36 +4573,65 @@ async function handleApi(req, res) {
       const body = await readJsonBody(req);
       const reqId = String(body.reqId || "");
       const entry = pendingServerRequests.get(reqId);
-      if (!entry) {
+      if (!entry || entry.retired) {
         return jsonResponse(res, 404, {
           error: `Pending request "${reqId}" not found (already resolved, expired, or from a previous daemon instance).`,
         });
       }
-      if (entry.submitting) {
+      if (entry.submitting || entry.replyClaimed) {
         return jsonResponse(res, 409, {
           error: `Pending request "${reqId}" is already being submitted by another client.`,
         });
       }
 
       const result = buildServerRequestResponse(entry, body);
+      const stBefore = getThreadState(entry.threadId);
+      const capturedTurnEpoch = stBefore.turnEpoch;
       entry.submitting = true;
-      const stBefore = threads.get(entry.threadId);
+      entry.replyClaimed = true;
       if (stBefore?.ownerConversationId) refreshConversationFlags(stBefore.ownerConversationId);
       try {
         await sendJsonRpcAsync({ jsonrpc: "2.0", id: entry.rpcId, result });
       } catch (err) {
-        if (pendingServerRequests.get(reqId) === entry) {
+        // Condition 3: only release replyClaimed when write provably failed BEFORE bytes were written and entry is still live
+        if (err && err.beforeWrite && !entry.retired && !entry.resolvedByServer && pendingServerRequests.get(reqId) === entry) {
           entry.submitting = false;
+          entry.replyClaimed = false;
           const stRollback = threads.get(entry.threadId);
           if (stRollback?.ownerConversationId) refreshConversationFlags(stRollback.ownerConversationId);
         }
         throw err;
       }
-      pendingServerRequests.delete(reqId);
+
+      entry.writeConfirmed = true;
+      const stillInPending = pendingServerRequests.get(reqId) === entry;
+      if (stillInPending) {
+        pendingServerRequests.delete(reqId);
+      }
 
       const st = getThreadState(entry.threadId);
-      if (listPendingRequests(entry.threadId).length === 0 && st.activeTurnId) {
-        st.status = "running";
+      // Only update status & clocks if this turn has NOT been superseded and write succeeded
+      if (!entry.retired && st.turnEpoch === capturedTurnEpoch) {
+        const nowMono = performance.now();
+        if (
+          stillInPending &&
+          st.status === "waiting_input" &&
+          st.activeTurnId &&
+          listBlockingPendingRequestsForTurn(st.threadId, st.activeTurnId).length === 0
+        ) {
+          st.status = "running";
+          st.lastProgressKind = "supervisor:responded";
+          onTurnEnteredRunning(st, nowMono, { creditContact: true });
+        } else if (
+          st.activeTurnId &&
+          entry.turnId === st.activeTurnId &&
+          st.status === "running" &&
+          (entry.resolvedByServer || entry.isBlocking === false)
+        ) {
+          // If serverRequest/resolved arrived first (resuming running without crediting contact), credit contact ONCE now
+          st.lastDeliveredContactMonoMs = Math.max(st.lastDeliveredContactMonoMs || 0, nowMono);
+          rescheduleBgWatchdog(st);
+        }
       }
       appendThreadLog(st, { kind: "server_request_responded", reqId, method: entry.method, result });
       if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
@@ -3406,10 +4648,10 @@ async function handleApi(req, res) {
     if (url.pathname === "/wait" && req.method === "POST") {
       const body = await readJsonBody(req);
       if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      const { timeoutSec, stallTimeoutSec, timeoutReceiptMode } = parseWaitRequestParams(body);
       pruneExpiredBatchesAndNotifications();
       const st = getThreadState(body.threadId);
       const { seq: afterSeq, provided: afterProvided, instanceMismatch } = parseCursor(body.after);
-      const timeoutSec = Math.max(1, Math.min(1800, Number(body.timeout ?? 600)));
       const eventsFilter = body.events || "critical";
       const callerConversationId = normalizeConversationId(body.ownerConversationId);
       const supportsAckBatch = Boolean(body.supportsAckBatch);
@@ -3432,7 +4674,7 @@ async function handleApi(req, res) {
 
       const existing = st.events.filter((e) => e.seq > afterSeq && levelMatches(e.level, eventsFilter));
       const hasCriticalExisting = existing.some((e) => e.level === "critical");
-      const pend = listPendingRequests(st.threadId);
+      const pend = listPendingRequestsForTurn(st.threadId, st.activeTurnId);
 
       if (hasCriticalExisting || pend.length > 0) {
         return respondWaitSync({ timedOut: false, matched: existing, gap, eventsFilter });
@@ -3448,6 +4690,7 @@ async function handleApi(req, res) {
 
       if (res.destroyed || res.writableEnded) return;
 
+      const waitStartMonoMs = performance.now();
       const payload = await new Promise((resolve) => {
         const waiter = {
           afterSeq,
@@ -3457,6 +4700,11 @@ async function handleApi(req, res) {
           ownerConversationId: callerConversationId,
           ownerGen: callerOwnerGen,
           supportsAckBatch,
+          timeoutSec,
+          stallTimeoutSec,
+          timeoutReceiptMode,
+          waitStartMonoMs,
+          hardDeadlineMonoMs: waitStartMonoMs + timeoutSec * 1000,
           resolve,
           res,
           timer: null,
@@ -3465,21 +4713,24 @@ async function handleApi(req, res) {
         };
         waiter.onClose = () => {
           if (!res.writableEnded && cleanupWaiter(st, waiter)) {
+            rescheduleBgWatchdog(st);
             resolve(null);
           }
         };
         res.on("close", waiter.onClose);
 
-        waiter.timer = setTimeout(() => resolveWaiter(st, waiter, true), timeoutSec * 1000);
+        // Register waiter BEFORE first timeout scheduling so scheduleWaiterTimeout sees it in st.waiters
+        st.waiters.add(waiter);
+        scheduleWaiterTimeout(st, waiter);
 
         // If buffered non-critical milestone exists while turn is active, honor remaining coalesce window
-        if (existing.length > 0) {
+        if (st.waiters.has(waiter) && existing.length > 0) {
           const newestTs = existing[existing.length - 1].tsMs || Date.now();
           const remaining = Math.max(0, COALESCE_MS - (Date.now() - newestTs));
           waiter.coalesceTimer = setTimeout(() => resolveWaiter(st, waiter, false), remaining);
         }
 
-        st.waiters.add(waiter);
+        rescheduleBgWatchdog(st);
         if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
       });
 
@@ -3622,6 +4873,9 @@ function unlinkOwnedStateFile(filePath) {
 function cleanupAndExit(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  for (const st of threads.values()) {
+    cancelWatchdogTimers(st, "cancelled", { reschedule: false });
+  }
   unlinkOwnedStateFile(STATE_FILE);
   unlinkOwnedStateFile(HOOK_STATE_FILE);
   try {
@@ -3688,6 +4942,7 @@ if (IDLE_TIMEOUT_MS > 0) {
         st.waiters.size === 0 &&
         now - st.updatedAt > IDLE_TIMEOUT_MS
       ) {
+        cancelWatchdogTimers(st, "cancelled", { reschedule: false });
         evictedThreadSeq.set(tid, st.nextSeq);
         if (evictedThreadSeq.size > 500) {
           const oldest = evictedThreadSeq.keys().next().value;

@@ -2,7 +2,7 @@
   "$schema": "https://antigravity.google/schemas/v1/plugin.json",
   "name": "codex-supervisor",
   "displayName": "Codex Supervisor",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Dispatch and supervise local OpenAI Codex sessions via codex app-server with mid-turn steering, native message_supervisor bidirectional comms, live side-pane chat viewer, thread forking, zero-polling wakeups, and automatic between-turn hook notifications.",
   "author": "cxgit12138",
   "homepage": "https://github.com/cxgit12138/codex-supervisor",

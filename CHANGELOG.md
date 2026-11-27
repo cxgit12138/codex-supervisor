@@ -2,6 +2,31 @@
 
 All notable changes to **Codex Supervisor** are documented in this file.
 
+## [1.4.1] - 2026-11-27
+
+### Added
+- **Activity-Aware Stall Watchdog (`watchdog-core.mjs`, `bridge-daemon.mjs`, `codex-ctl.mjs`)**:
+  - Replaces blind fixed-interval heartbeat polling with dual-threshold activity-aware stall detection: **10 min (`600s`) silence stall threshold** + **30 min (`1800s`) hard ceiling** by default.
+  - Tracks real Codex progress (`item/started`, `item/completed`, streaming text/reasoning/command/file deltas, `plan/updated` & `patchUpdated` schema-bounded digests, and blocking approvals/questions) using three orthogonal monotonic (`performance.now()`) clocks (`turnRunningSince`, `lastProgress`, `lastDeliveredContact`) that refresh cleanly after every confirmed supervisor wakeup.
+  - Added `--stall-timeout <sec>` (`0..1800`, `0` disables silence detection) to `codex-ctl.mjs wait`, with strict `/health` `capabilities.stallWatchdog === true` negotiation and bidirectional compatibility with older v1.4.0 daemons.
+  - Includes sanitized diagnostic metadata (`timeoutReason: "stall" | "max_wait"`, `silentSec`, `lastActivityKind`, `lastActivityAt`, allowlisted `activeItems`, and sanitized `lastNonRetryableError.code`) in timeout wakeups and `status` summaries.
+- **Unwaited Hook / Inbox Background Watchdog**:
+  - Runs an independent background watchdog (`CODEX_BRIDGE_BG_STALL_SEC=600`, `CODEX_BRIDGE_BG_MAX_RUN_SEC=1800`) for active turns with no attached foreground `wait`, delivering deduplicated `inboxOnly` `turn_watchdog` notifications via existing `PreInvocation` / `Stop` hooks and `codex-ctl.mjs inbox` (without modifying the fixed security-isolated hook templates).
+  - Enforces a single-writer alert slot per turn with `fg_timeout_receipt` lease confirmation (`auto` 5s / `manual` 30s), seamlessly handing off failed foreground `EPIPE` deliveries to the background inbox without duplicate storms.
+- **Portable 11-Group Watchdog Verification Suite (`tests/verify-watchdog.mjs`)**:
+  - Covers unit scheduling/sanitization, active streaming suppression, silent stall detection, `EPIPE` handoff, multi-waiter slot contention, full-queue self-eviction, turn isolation & `0.169.1` cancel payloads, unwaited Hook/Inbox delivery, `--force` rescheduling, and mixed-version compatibility.
+
+### Changed
+- **Codex `0.169.1` App-Server Protocol Hardening**:
+  - Strict `threadId + turnId` scoping prevents late notifications or superseded turns from resurrecting completed turns or poisoning active stall timers.
+  - Enforces single-reply authority on server requests with exact `0.169.1` retirement/cancel payloads (`{ permissions: {}, scope: "turn" }` for permissions, `{ decision: "abort" }` for legacy approvals, `{ decision: "cancel" }` for v2 approvals, `-32602` on malformed requests) and distinguishes non-blocking `item/tool/requestUserInput` (`isBlocking: false`).
+  - Upgraded `POST /wait` validation to strict non-coercing JSON integers and two-phase disconnect cleanup across multi-thread teardown.
+
+### Upgrade Notes
+- Finish active tasks and run `codex-ctl.mjs stop` so the bridge restarts on the v1.4.1 daemon advertising `capabilities.stallWatchdog: true`.
+
+---
+
 ## [1.4.0] - 2026-11-26
 
 ### Added

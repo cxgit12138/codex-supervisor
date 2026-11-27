@@ -24,8 +24,8 @@
   - 自动跟随 Antigravity 宿主亮/暗色主题，采用 ETag 增量轮询与磁盘缓存，查看面板 **零 LLM Token 消耗**。
 - **零轮询事件唤醒（Reactive Wait）+ 工具轮次间隙自动通知（Lifecycle Hooks）**
   - 常驻本地桥接守护进程 `bridge-daemon.mjs` 维持 `codex app-server --stdio` 长连接；
-  - Antigravity 挂起后台 `wait` 后仅在关键节点（主动汇报/请示、审批请求、回合完成、出错或心跳）唤醒，大幅节省 Token；
-  - 即使 Antigravity **未挂 `wait`、正在忙其他任务**，插件自带的 `hooks.json`（`PreInvocation` 与条件启用的 `Stop`）也会在下一轮工具间隙注入精简固定模板系统提醒（防 Prompt Injection 提权），引导通过 `codex-ctl.mjs inbox` 按普通工具权限分页读取正文（单页 ≤16 KiB，存在 `hasMore` 时继续拉取；内存保留随当前 daemon 实例最长 60 分钟，确认边界为 CLI 完整写出 stdout）；在支持 `Stop` 停机原因与 `continuationActive: false` 字段的客户端上，准备彻底停机而 Codex 仍在跑且未挂 `wait` 时会自动兜底提醒一次。
+  - Antigravity 挂起后台 `wait` 后仅在关键节点（主动汇报/请示、审批请求、回合完成、出错或**智能静默卡死检测**：连续 10 分钟无桥接层活动才触发 `stall`，单次等待硬上限 30 分钟防活锁，健康长任务零多余唤醒）唤醒，大幅节省 Token；
+  - 即使 Antigravity **未挂 `wait`、正在忙其他任务**，插件自带的 `hooks.json`（`PreInvocation` 与条件启用的 `Stop`）也会在下一轮工具间隙注入精简固定模板系统提醒（防 Prompt Injection 提权），引导通过 `codex-ctl.mjs inbox` 按普通工具权限分页读取正文（含后台卡死/超限去重告警 `turn_watchdog`，单页 ≤16 KiB，存在 `hasMore` 时继续拉取；内存保留随当前 daemon 实例最长 60 分钟，确认边界为 CLI 完整写出 stdout）；在支持 `Stop` 停机原因与 `continuationActive: false` 字段的客户端上，准备彻底停机而 Codex 仍在跑且未挂 `wait` 时会自动兜底提醒一次（完全空闲的会话无法由外部主动推醒）。
 - **原生双向通信工具 `message_supervisor`**
   - 新建会话时自动向 Codex 注入动态工具 `message_supervisor(message, wait_for_reply)`：
     - `wait_for_reply: false`：Codex 边干活边向 Antigravity 发送阶段汇报或风险提示；
@@ -66,14 +66,14 @@ agy plugin install https://github.com/cxgit12138/codex-supervisor
 **Windows（PowerShell）：**
 
 ```powershell
-# 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.0）
+# 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.1）
 git clone https://github.com/cxgit12138/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
 ```
 
 **macOS / Linux：**
 
 ```bash
-# 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.0）
+# 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.1）
 git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
 ```
 
@@ -81,7 +81,7 @@ git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/conf
 
 #### 升级插件
 
-- **通过 `git clone` 安装**：在插件目录执行 `git pull`（或 `git fetch --tags && git checkout v1.4.0`）；
+- **通过 `git clone` 安装**：在插件目录执行 `git pull`（或 `git fetch --tags && git checkout v1.4.1`）；
 - **通过 CLI 安装**：重新运行安装命令或拉取最新 Release；
 - 升级完成后，若已有旧版桥接进程在运行，待当前任务结束执行一次 `codex-ctl.mjs stop`，然后**重启一次 Antigravity 客户端**（使新版 Sidecar 面板与 `hooks.json` 生效）。
 
@@ -128,6 +128,7 @@ codex-supervisor/
 │   ├── SKILL.md                        # Antigravity 监工操作协议
 │   └── scripts/
 │       ├── bridge-daemon.mjs           # 本地 127.0.0.1 桥接守护进程 + codex app-server 客户端
+│       ├── watchdog-core.mjs           # 纯函数单调时钟卡死看门狗与有界变更摘要模块
 │       └── codex-ctl.mjs               # 精简 CLI 控制端
 └── tests/                              # 可移植 E2E 回归测试（仅开发验证，不被宿主加载）
     ├── verify-hooks-e2e.mjs            # `node tests/verify-hooks-e2e.mjs` 一键跑 26 组端到端测试
@@ -188,7 +189,7 @@ codex-supervisor/
 ### Highlights
 
 - **Native Side-Pane Chat Viewer (`sidecars/codex_panel`)**: Live left (Codex) / right (Antigravity) conversation stream with a 3-tier detail switcher (`Minimal` / `Default` / `Detailed`), workspace & model badges, per-bubble `model · effort` indicators, collapsible command/diff/tool outputs, Antigravity light/dark theme sync, and ETag polling at **zero LLM token cost**.
-- **Zero-Polling Reactive Supervision + Between-Turn Hook Notifications**: A local `127.0.0.1` bridge daemon (`bridge-daemon.mjs`) holds the `codex app-server --stdio` session and wakes background `wait` calls only on milestones, requests, completion, or errors. Even when Antigravity is busy with other work without an active `wait`, bundled `hooks.json` (`PreInvocation` and conditional `Stop` on clients emitting `NO_TOOL_CALL` + `continuationActive: false`) injects fixed-template reminders between tool turns so Antigravity can safely inspect paginated untrusted Codex payloads (≤16 KiB/page, up to 60 min in-memory retention per daemon instance, auto-ACK on complete CLI stdout) via `codex-ctl.mjs inbox` and arm `wait` before going idle.
+- **Zero-Polling Reactive Supervision + Activity-Aware Stall Watchdog + Hook Notifications**: A local `127.0.0.1` bridge daemon (`bridge-daemon.mjs`) holds the `codex app-server --stdio` session (verified against `codex-cli 0.169.1`) and wakes background `wait` calls only on milestones, requests, completion, errors, or genuine turn silence (default 10 min stall watchdog + 30 min per-request hard ceiling, eliminating spurious wakeups on healthy long runs; graceful fallback to 600s fixed wait on older daemons). Even when Antigravity is busy without an active `wait`, bundled `hooks.json` (`PreInvocation` and conditional `Stop` on clients emitting `NO_TOOL_CALL` + `continuationActive: false`) injects fixed-template reminders between tool turns — including deduplicated `turn_watchdog` inbox alerts when an owned running turn stalls or hits the 30 min no-contact ceiling — so Antigravity can safely inspect paginated untrusted Codex payloads (≤16 KiB/page, auto-ACK on complete CLI stdout) via `codex-ctl.mjs inbox` and arm `wait` before going idle.
 - **Native Bidirectional `message_supervisor` Tool**: Codex can proactively push non-blocking progress updates (`wait_for_reply: false`) or pause to ask the supervisor for decisions (`wait_for_reply: true`).
 - **Mid-Turn Steering (`turn/steer`), Approvals & Thread Forking**: Inject corrections while Codex is still working, handle command/patch/permission approvals explicitly, and `fork` Codex Desktop threads cleanly without writer-lock conflicts.
 - **Secure & Self-Contained**: Zero npm dependencies, loopback-only bridge with random Bearer token, owner-only state/logs under `~/.gemini/cache/codex-supervisor/` (NTFS DACL hardening on Windows, `0o700`/`0o600` on POSIX), and token-authenticated `POST` sidecar API.
@@ -205,7 +206,7 @@ codex-supervisor/
 agy plugin install https://github.com/cxgit12138/codex-supervisor
 ```
 
-Or clone manually into Antigravity's global plugins directory (append `--branch v1.4.0` to pin a stable release, or download a source archive from [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases)):
+Or clone manually into Antigravity's global plugins directory (append `--branch v1.4.1` to pin a stable release, or download a source archive from [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases)):
 
 ```powershell
 # Windows (PowerShell)
@@ -219,14 +220,14 @@ git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/conf
 
 To upgrade, run `git pull` (or check out the latest release tag), stop any older running bridge daemon via `codex-ctl.mjs stop` after active tasks finish, and restart **Antigravity** once so `hooks.json` and the Sidecar reload cleanly.
 
-Then open the live chat panel via the sidecar **`+`** button → **Codex Supervisor**, and ask Antigravity to delegate a task to Codex. See [CHANGELOG.md](CHANGELOG.md) for release history, and run `node tests/verify-hooks-e2e.mjs` to execute the portable 26-scenario E2E suite.
+Then open the live chat panel via the sidecar **`+`** button → **Codex Supervisor**, and ask Antigravity to delegate a task to Codex. See [CHANGELOG.md](CHANGELOG.md) for release history, and run `node tests/verify-hooks-e2e.mjs` / `node tests/verify-watchdog.mjs` to execute the portable E2E suites.
 
 ### Notes & Troubleshooting
 
 - **Codex Desktop writer locks (`already has an active writer`)**: On Windows, once Codex Desktop App opens a thread during a run, it holds the file writer lock until the Desktop App exits. Use **`fork`** to branch the thread cleanly without closing Desktop App, or exit Desktop App before calling `resume`. New sessions do not require Codex Desktop App to be running.
 - **Why older Desktop threads aren't in the side-pane dropdown**: The panel only lists sessions supervised via this plugin (`~/.gemini/cache/codex-supervisor/logs/`). `resume` or `fork` any Desktop thread once to bring it into the panel.
 - **`message_supervisor` availability**: Dynamic tools are registered on `thread/start`, so native `message_supervisor` pings/questions apply to newly started threads (resumed/forked threads still support full `send`, `steer`, `interrupt`, approvals, and live side-pane viewing).
-- **Panel missing or Hooks didn't activate after install/update**: Restart the **Antigravity** client once so `hooks.json`, the sidecar backend process, and webview cache initialize cleanly (toggling the plugin in-place may not re-register hooks or re-spawn sidecar processes on some Antigravity builds). If an older daemon was running, run `codex-ctl.mjs stop` after current tasks finish to switch to the v1.4.0 daemon.
+- **Panel missing or Hooks didn't activate after install/update**: Restart the **Antigravity** client once so `hooks.json`, the sidecar backend process, and webview cache initialize cleanly (toggling the plugin in-place may not re-register hooks or re-spawn sidecar processes on some Antigravity builds). If an older daemon was running, run `codex-ctl.mjs stop` after current tasks finish to switch to the v1.4.1 daemon.
 - **Releasing locks after supervision**: The bridge daemon auto-exits after 60 minutes of idle time, or run `codex-ctl.mjs stop` to release thread locks immediately.
 
 ---

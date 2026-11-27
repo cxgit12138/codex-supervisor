@@ -181,7 +181,7 @@ await test("0. Syntax & manifest validation", async () => {
   assert.ok(Array.isArray(hooksJson["codex-supervisor-notifications"].PreInvocation));
   assert.ok(Array.isArray(hooksJson["codex-supervisor-notifications"].Stop));
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO, "plugin.json"), "utf8"));
-  assert.equal(pkg.version, "1.4.0");
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
 });
 
 await test("1. Dual-conversation routing, non-stealing wait/send/steer, clean resume --claim & fork", async () => {
