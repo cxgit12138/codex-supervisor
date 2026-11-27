@@ -17,6 +17,9 @@ All notable changes to **Codex Supervisor** are documented in this file.
   - Covers unit scheduling/sanitization, active streaming suppression, silent stall detection, `EPIPE` handoff, multi-waiter slot contention, full-queue self-eviction, turn isolation & `0.169.1` cancel payloads, unwaited Hook/Inbox delivery, `--force` rescheduling, and mixed-version compatibility.
 
 ### Changed
+- **Sidecar Panel Collapsible Long Bubbles (`sidecars/codex_panel/app.js`, `styles.css`, `index.html`)**:
+  - Caps tall non-tool chat bubbles at `260px` (with a `56px` hysteresis buffer so short overflows stay natural) using a theme-aware bottom fade mask and a minimalist `显示更多` / `收起` toggle with zero inner scrollbars.
+  - Preserves expanded bubble state and keyboard focus across poll re-renders, anchors scroll cleanly on collapse (keeping the toggle visible in short viewports), links buttons via `aria-controls`, and adapts smoothly to panel width/height resizes.
 - **Codex `0.169.1` App-Server Protocol Hardening**:
   - Strict `threadId + turnId` scoping prevents late notifications or superseded turns from resurrecting completed turns or poisoning active stall timers.
   - Enforces single-reply authority on server requests with exact `0.169.1` retirement/cancel payloads (`{ permissions: {}, scope: "turn" }` for permissions, `{ decision: "abort" }` for legacy approvals, `{ decision: "cancel" }` for v2 approvals, `-32602` on malformed requests) and distinguishes non-blocking `item/tool/requestUserInput` (`isBlocking: false`).

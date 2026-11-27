@@ -263,25 +263,26 @@ html, body {
 }
 
 .bubble {
+  --cs-bubble-bg: var(--cs-codex-bg);
   max-width: 88%;
   padding: 9px 12px;
   border-radius: 12px;
   border: 1px solid var(--cs-codex-border);
-  background: var(--cs-codex-bg);
+  background: var(--cs-bubble-bg);
   word-break: break-word;
 }
 .bubble-codex {
   border-top-left-radius: 4px;
 }
 .bubble-supervisor {
-  background: var(--cs-sup-bg);
+  --cs-bubble-bg: var(--cs-sup-bg);
   border-color: var(--cs-sup-border);
   border-top-right-radius: 4px;
 }
 .bubble-process {
+  --cs-bubble-bg: color-mix(in srgb, var(--cs-muted) 65%, var(--cs-surface));
   opacity: 0.88;
   border-style: dashed;
-  background: color-mix(in srgb, var(--cs-muted) 65%, var(--cs-surface));
 }
 
 .bubble-head {
@@ -348,6 +349,66 @@ html, body {
   background: transparent;
   white-space: pre-wrap;
   word-break: break-all;
+}
+
+.bubble-body-wrap {
+  position: relative;
+}
+.bubble-body-wrap.is-collapsed {
+  max-height: 260px;
+  overflow: hidden;
+}
+.bubble-fade {
+  display: none;
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 54px;
+  pointer-events: none;
+  background: linear-gradient(
+    to bottom,
+    color-mix(in srgb, var(--cs-bubble-bg) 0%, transparent) 0%,
+    color-mix(in srgb, var(--cs-bubble-bg) 82%, transparent) 64%,
+    var(--cs-bubble-bg) 100%
+  );
+}
+.bubble-body-wrap.is-collapsed .bubble-fade {
+  display: block;
+}
+.bubble-expand-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin: 4px 0 -2px -6px;
+  padding: 3px 6px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--cs-fg-muted);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.3;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.14s ease, color 0.14s ease;
+}
+.bubble-expand-btn:hover {
+  background: color-mix(in srgb, var(--cs-fg) 6%, transparent);
+  color: var(--cs-fg);
+}
+.bubble-expand-btn:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--cs-primary) 55%, transparent);
+  outline-offset: 1px;
+}
+.bubble-expand-btn svg {
+  flex: 0 0 auto;
+  opacity: 0.85;
+  transition: transform 0.16s ease;
+}
+.bubble-expand-btn[aria-expanded="true"] svg {
+  transform: rotate(180deg);
 }
 
 .cmd-details {

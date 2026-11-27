@@ -5,6 +5,9 @@
  */
 (() => {
   const POLL_MS = 1400;
+  const COLLAPSE_MAX_PX = 260;
+  const COLLAPSE_TRIGGER_PX = COLLAPSE_MAX_PX + 56; // Avoid folding bubbles that only overflow by 1-2 lines
+  const CHEVRON_SVG = `<svg width="12" height="12" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6l4 4 4-4"/></svg>`;
   const $ = (id) => document.getElementById(id);
 
   const VALID_MODES = new Set(["minimal", "default", "detailed"]);
@@ -25,6 +28,7 @@
     lastListKey: "",
     renderedThreadId: "",
     openDetails: new Set(),
+    expandedBubbles: new Set(),
   };
 
   function showDiagError(msg) {
@@ -224,6 +228,35 @@
     return tier === "core";
   }
 
+  function setExpandButtonState(btn, expanded) {
+    btn.setAttribute("aria-expanded", expanded ? "true" : "false");
+    const label = btn.querySelector(".expand-label");
+    if (label) label.textContent = expanded ? "收起" : "显示更多";
+  }
+
+  function applyBubbleCollapse(listEl, threadId) {
+    if (!listEl || !threadId) return;
+    for (const bubble of listEl.querySelectorAll('.bubble[data-collapsible="1"]')) {
+      const wrap = bubble.querySelector(".bubble-body-wrap");
+      const body = wrap?.querySelector(".bubble-body");
+      const btn = bubble.querySelector(".bubble-expand-btn");
+      if (!wrap || !body || !btn) continue;
+      // Measure true natural content height of inner .bubble-body (unclipped even when wrap is collapsed)
+      const fullHeight = body.scrollHeight;
+      const needsCollapse = fullHeight > COLLAPSE_TRIGGER_PX;
+      if (!needsCollapse) {
+        wrap.classList.remove("is-collapsed");
+        btn.classList.add("hidden");
+        continue;
+      }
+      const key = `${threadId}:${bubble.dataset.bubbleId}`;
+      const expanded = state.expandedBubbles.has(key);
+      wrap.classList.toggle("is-collapsed", !expanded);
+      btn.classList.remove("hidden");
+      setExpandButtonState(btn, expanded);
+    }
+  }
+
   function renderActive(data) {
     const dot = $("status-dot");
     const chips = $("meta-chips");
@@ -273,6 +306,14 @@
         if (det.open) state.openDetails.add(key);
         else state.openDetails.delete(key);
       }
+      const activeEl = document.activeElement;
+      const focusedExpandId =
+        state.renderedThreadId === meta.threadId &&
+        activeEl instanceof HTMLElement &&
+        activeEl.classList.contains("bubble-expand-btn") &&
+        list.contains(activeEl)
+          ? activeEl.dataset.expandId || null
+          : null;
 
       if (!filtered.length) {
         list.innerHTML = `<div class="empty-state"><div class="empty-desc">当前档位暂无可显示的对话消息${meta.processCount ? "（可切换右上角「默认 / 详细」查看过程说明与工具调用）" : ""}。</div></div>`;
@@ -284,6 +325,7 @@
             }
             const isSup = m.side === "supervisor";
             const role = isSup ? "Antigravity" : "Codex";
+            const isCollapsible = (m.tier || "core") !== "tool";
             const cls = [
               "bubble",
               isSup ? "bubble-supervisor" : "bubble-codex",
@@ -293,21 +335,35 @@
             const detailHtml = m.detail
               ? `<details class="cmd-details" data-msg-id="${esc(m.id)}"${openAttr}><summary>查看输出详情</summary><pre>${esc(m.detail)}</pre></details>`
               : "";
+            const bodyId = `bubble-body-${esc(m.id)}`;
+            const bodyHtml = isCollapsible
+              ? `<div id="${bodyId}" class="bubble-body-wrap"><div class="bubble-body">${renderMarkdown(m.text)}</div><div class="bubble-fade" aria-hidden="true"></div></div>
+                  <button type="button" class="bubble-expand-btn hidden" data-expand-id="${esc(m.id)}" aria-controls="${bodyId}" aria-expanded="false"><span class="expand-label">显示更多</span>${CHEVRON_SVG}</button>`
+              : `<div class="bubble-body">${renderMarkdown(m.text)}</div>`;
             return `
               <div class="msg-row side-${m.side}">
-                <div class="${cls}">
+                <div class="${cls}" data-bubble-id="${esc(m.id)}"${isCollapsible ? ' data-collapsible="1"' : ""}>
                   <div class="bubble-head">
                     <span class="role-name">${role}</span>
                     ${m.badge ? `<span class="badge tone-${esc(m.tone || "muted")}">${esc(m.badge)}</span>` : ""}
                     ${m.sub ? `<span class="meta-sub">${esc(m.sub)}</span>` : ""}
                     <span class="msg-time">${esc(fmtTime(m.ts))}</span>
                   </div>
-                  <div class="bubble-body">${renderMarkdown(m.text)}</div>
+                  ${bodyHtml}
                   ${detailHtml}
                 </div>
               </div>`;
           })
           .join("");
+        applyBubbleCollapse(list, meta.threadId);
+        if (focusedExpandId) {
+          for (const btn of list.querySelectorAll(".bubble-expand-btn")) {
+            if (btn.dataset.expandId === focusedExpandId && !btn.classList.contains("hidden")) {
+              btn.focus({ preventScroll: true });
+              break;
+            }
+          }
+        }
       }
       state.lastListKey = listKey;
       state.renderedThreadId = meta.threadId;
@@ -415,16 +471,87 @@
 
   const scroller = $("chat-scroll");
   const scrollBtn = $("scroll-bottom-btn");
-  scroller.addEventListener("scroll", () => {
+  const chatList = $("chat-list");
+
+  function syncScrollBtn() {
     const dist = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
     state.stickToBottom = dist < 48;
     scrollBtn.classList.toggle("hidden", state.stickToBottom);
-  });
+  }
+
+  scroller.addEventListener("scroll", syncScrollBtn);
   scrollBtn.addEventListener("click", () => {
     state.stickToBottom = true;
     scroller.scrollTop = scroller.scrollHeight;
     scrollBtn.classList.add("hidden");
   });
+
+  chatList.addEventListener("click", (e) => {
+    const btn = e.target.closest(".bubble-expand-btn");
+    if (!btn) return;
+    const bubble = btn.closest('.bubble[data-collapsible="1"]');
+    const wrap = bubble?.querySelector(".bubble-body-wrap");
+    const tid = state.renderedThreadId;
+    if (!bubble || !wrap || !tid) return;
+
+    const key = `${tid}:${bubble.dataset.bubbleId}`;
+    const nextExpanded = !state.expandedBubbles.has(key);
+    if (nextExpanded) {
+      state.expandedBubbles.add(key);
+      if (state.expandedBubbles.size > 500) {
+        const oldest = state.expandedBubbles.keys().next().value;
+        state.expandedBubbles.delete(oldest);
+      }
+    } else {
+      state.expandedBubbles.delete(key);
+    }
+
+    wrap.classList.toggle("is-collapsed", !nextExpanded);
+    setExpandButtonState(btn, nextExpanded);
+
+    // When collapsing a tall bubble whose top is scrolled above the viewport, anchor cleanly to its top
+    // while ensuring the focused toggle button remains visible even in short panels
+    if (!nextExpanded) {
+      const bRect = bubble.getBoundingClientRect();
+      const sRect = scroller.getBoundingClientRect();
+      if (bRect.top < sRect.top) {
+        scroller.scrollTop += bRect.top - sRect.top - 12;
+      }
+      const btnRect = btn.getBoundingClientRect();
+      if (btnRect.bottom > sRect.bottom) {
+        scroller.scrollTop += btnRect.bottom - sRect.bottom + 12;
+      }
+    }
+    syncScrollBtn();
+  });
+
+  if (typeof ResizeObserver === "function") {
+    let lastW = 0;
+    let lastH = 0;
+    let resizeRaf = 0;
+    const ro = new ResizeObserver((entries) => {
+      const rect = entries[0]?.contentRect;
+      const w = Math.round(rect?.width || 0);
+      const h = Math.round(rect?.height || 0);
+      if ((!w && !h) || (w === lastW && h === lastH)) return;
+      const widthChanged = w !== lastW;
+      lastW = w;
+      lastH = h;
+      if (resizeRaf) cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        resizeRaf = 0;
+        const wasSticking = state.stickToBottom;
+        if (widthChanged && state.renderedThreadId) {
+          applyBubbleCollapse(chatList, state.renderedThreadId);
+        }
+        if (wasSticking) {
+          scroller.scrollTop = scroller.scrollHeight;
+        }
+        syncScrollBtn();
+      });
+    });
+    ro.observe(scroller);
+  }
 
   document.addEventListener("visibilitychange", () => {
     if (!document.hidden) poll(false);
