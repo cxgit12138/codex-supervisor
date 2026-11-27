@@ -1317,6 +1317,10 @@ function getThreadState(threadId) {
       name: null,
       cwd: null,
       model: null,
+      effort: null,
+      activeTurnModel: null,
+      activeTurnEffort: null,
+      hasUnobservedActiveTurn: false,
       sandbox: null,
       approvalPolicy: null,
       status: "idle", // idle | running | waiting_input | error
@@ -2263,6 +2267,10 @@ function buildCompactSummary(st) {
     name: st.name,
     cwd: st.cwd,
     model: st.model,
+    effort: st.effort,
+    ...(st.activeTurnId
+      ? { activeTurnModel: st.activeTurnModel, activeTurnEffort: st.activeTurnEffort }
+      : {}),
     sandbox: st.sandbox,
     approvalPolicy: st.approvalPolicy,
     status: st.status,
@@ -2421,6 +2429,9 @@ function ensureTurnStarted(st, turnId, { source = "notification", emitEvent = fa
   st.turnEpoch += 1;
   addBoundedSet(st.startedTurnIds, turnId, MAX_TURN_HISTORY);
   st.activeTurnId = turnId;
+  st.activeTurnModel = st.model;
+  st.activeTurnEffort = st.effort;
+  st.hasUnobservedActiveTurn = false;
   st.lastTurnId = turnId;
   st.status = "running";
   st.lastError = null;
@@ -2829,6 +2840,9 @@ function handleServerNotification(msg) {
     const turnTokenUsageSnap = st.turnTokenUsage;
 
     st.activeTurnId = null;
+    st.activeTurnModel = null;
+    st.activeTurnEffort = null;
+    st.hasUnobservedActiveTurn = false;
     st.lastTurnId = turnId || st.lastTurnId;
     st.status = isFailed ? "error" : "idle";
     if (isFailed) {
@@ -2869,6 +2883,12 @@ function handleServerNotification(msg) {
 
   if (method === "thread/status/changed" && threadId) {
     const st = getThreadState(threadId);
+    const statusType = p.status?.type || null;
+    if (statusType === "active" && !st.activeTurnId) {
+      st.hasUnobservedActiveTurn = true;
+    } else if (statusType && statusType !== "active") {
+      st.hasUnobservedActiveTurn = false;
+    }
     appendThreadLog(st, { kind: "thread_status_changed", params: p });
     return;
   }
@@ -3157,6 +3177,9 @@ function failAllPendingAndWaiters(reason) {
     if (wasActive) {
       st.status = "error";
       st.activeTurnId = null;
+      st.activeTurnModel = null;
+      st.activeTurnEffort = null;
+      st.hasUnobservedActiveTurn = false;
       st.lastError = { message: reason };
       activeToNotify.push(st);
     }
@@ -3306,8 +3329,73 @@ function makeTextInput(prompt) {
 }
 
 function markTurnStartedIfNotFinished(st, turnId, expectedEpoch = null) {
-  if (!turnId) return;
-  ensureTurnStarted(st, turnId, { source: "rpc", emitEvent: false, expectedEpoch });
+  if (!turnId) return false;
+  return ensureTurnStarted(st, turnId, { source: "rpc", emitEvent: false, expectedEpoch });
+}
+
+function extractResponseEffort(resObj) {
+  if (resObj && typeof resObj === "object") {
+    if ("reasoningEffort" in resObj) return resObj.reasoningEffort || null;
+    if (resObj.thread && typeof resObj.thread === "object" && "reasoningEffort" in resObj.thread) {
+      return resObj.thread.reasoningEffort || null;
+    }
+  }
+  return undefined;
+}
+
+function resolveNextModelAndEffort(st, body) {
+  const prevModel = st.model || null;
+  const nextModel = body.model || prevModel;
+  const modelChanged = Boolean(body.model && prevModel && body.model !== prevModel);
+  let nextEffort;
+  if (body.effort) {
+    nextEffort = body.effort;
+  } else if (modelChanged) {
+    nextEffort = null;
+  } else {
+    nextEffort = st.effort || null;
+  }
+  return { model: nextModel, effort: nextEffort };
+}
+
+function commitAdmittedTurnModelAndEffort(st, turnId, admitted, snapshot, isSameTurnAppend = false) {
+  const committed =
+    Boolean(turnId) &&
+    (admitted || (st.completedTurnIds.has(turnId) && !st.supersededTurnIds.has(turnId) && st.lastTurnId === turnId));
+  if (!committed) return { committed: false, turnConfigApplied: false };
+  st.model = snapshot.model;
+  st.effort = snapshot.effort;
+  const turnConfigApplied = !isSameTurnAppend;
+  if (turnConfigApplied && st.activeTurnId === turnId) {
+    st.activeTurnModel = snapshot.model;
+    st.activeTurnEffort = snapshot.effort;
+  }
+  return { committed: true, turnConfigApplied };
+}
+
+function prepareTurnStartContext(st, body, explicitSnapshot = null) {
+  return {
+    snapshot: explicitSnapshot || resolveNextModelAndEffort(st, body),
+    preActiveTurnId: st.activeTurnId,
+    preWasBusy: Boolean(
+      st.activeTurnId ||
+      st.status === "running" ||
+      st.status === "waiting_input" ||
+      st.hasUnobservedActiveTurn
+    ),
+    preStartedSnapshot: new Set(st.startedTurnIds),
+    expectedEpoch: st.turnEpoch,
+  };
+}
+
+function finalizeTurnStart(st, turnId, ctx) {
+  const wasKnownBeforeRpc = Boolean(turnId && (turnId === ctx.preActiveTurnId || ctx.preStartedSnapshot.has(turnId)));
+  const wasActiveBeforeMark = Boolean(turnId && st.activeTurnId === turnId);
+  const sawFreshTurnStartedNotif = Boolean(turnId && !wasKnownBeforeRpc && st.turnStartedEventEmitted.has(turnId));
+  const admitted = markTurnStartedIfNotFinished(st, turnId, ctx.expectedEpoch);
+  const createdFreshByRpc = Boolean(admitted && !wasActiveBeforeMark && !wasKnownBeforeRpc);
+  const confirmedNewTurn = !ctx.preWasBusy && (createdFreshByRpc || sawFreshTurnStartedNotif);
+  return commitAdmittedTurnModelAndEffort(st, turnId, admitted, ctx.snapshot, !confirmedNewTurn);
 }
 
 function isNoActiveTurnError(err) {
@@ -3451,11 +3539,12 @@ function applyCollaborationMode(turnParams, body, st) {
     err.statusCode = 400;
     throw err;
   }
+  const effEffort = body.effort || ((!body.model || body.model === st.model) ? st.effort : null);
   turnParams.collaborationMode = {
     mode,
     settings: {
       model: effModel,
-      ...(body.effort ? { reasoning_effort: body.effort } : {}),
+      ...(effEffort ? { reasoning_effort: effEffort } : {}),
     },
   };
   return mode;
@@ -4080,6 +4169,8 @@ async function handleApi(req, res) {
         bindNewThreadOwner(st, body.ownerConversationId);
         st.cwd = thRes.cwd || thRes.thread?.cwd || body.cwd || null;
         st.model = thRes.model || body.model || null;
+        const startRespEffort = extractResponseEffort(thRes);
+        st.effort = startRespEffort !== undefined ? startRespEffort : null;
         st.sandbox = normalizeSandboxPolicy(thRes.sandbox) || body.sandbox || null;
         st.approvalPolicy = normalizeApprovalPolicy(thRes.approvalPolicy) || body.approvalPolicy || null;
 
@@ -4096,6 +4187,7 @@ async function handleApi(req, res) {
           name: st.name,
           cwd: st.cwd,
           model: st.model,
+          effort: st.effort,
           sandbox: st.sandbox,
           approvalPolicy: st.approvalPolicy,
         });
@@ -4112,17 +4204,20 @@ async function handleApi(req, res) {
           if (body.cwd) turnParams.cwd = body.cwd;
           if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
           applyCollaborationMode(turnParams, body, st);
-          const expectedEpoch = st.turnEpoch;
+          const turnCtx = prepareTurnStartContext(st, body);
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+          const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
           if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
             action: "start",
             turnId,
-            model: body.model || st.model,
-            effort: body.effort || null,
+            model: turnCtx.snapshot.model,
+            effort: turnCtx.snapshot.effort,
+            effortExplicit: true,
+            committed: commitInfo.committed,
+            turnConfigApplied: commitInfo.turnConfigApplied,
             mode: reqMode,
             prompt: body.prompt,
           });
@@ -4174,11 +4269,25 @@ async function handleApi(req, res) {
         }
 
         const st = getThreadState(body.threadId);
+        const prevModel = st.model;
+        const nextModel = resData.model || st.model;
+        const resumeRespEffort = extractResponseEffort(resData);
         st.cwd = effCwd || st.cwd;
-        st.model = resData.model || st.model;
+        st.model = nextModel;
+        if (resumeRespEffort !== undefined) {
+          st.effort = resumeRespEffort;
+        } else if (nextModel !== prevModel) {
+          st.effort = null;
+        }
         st.sandbox = effSandbox || st.sandbox;
         st.approvalPolicy = effApproval || st.approvalPolicy;
         st.name = resData.thread?.name || st.name;
+        const resumedStatusType = resData.thread?.status?.type || null;
+        if (resumedStatusType === "active" && !st.activeTurnId) {
+          st.hasUnobservedActiveTurn = true;
+        } else if (resumedStatusType && resumedStatusType !== "active") {
+          st.hasUnobservedActiveTurn = false;
+        }
 
         if (mismatches.length > 0) {
           const err = new Error(`Resume constraint mismatch (upstream kept loaded thread settings): ${mismatches.join("; ")}`);
@@ -4256,6 +4365,7 @@ async function handleApi(req, res) {
           name: st.name,
           cwd: st.cwd,
           model: st.model,
+          effort: st.effort,
           sandbox: st.sandbox,
           approvalPolicy: st.approvalPolicy,
         });
@@ -4267,17 +4377,20 @@ async function handleApi(req, res) {
           if (body.model) turnParams.model = body.model;
           if (body.effort) turnParams.effort = body.effort;
           applyCollaborationMode(turnParams, body, st);
-          const expectedEpoch = st.turnEpoch;
+          const turnCtx = prepareTurnStartContext(st, body);
           const tRes = await rpcCall("turn/start", turnParams);
           turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+          const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
           if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
             action: "resume",
             turnId,
-            model: body.model || st.model,
-            effort: body.effort || null,
+            model: turnCtx.snapshot.model,
+            effort: turnCtx.snapshot.effort,
+            effortExplicit: true,
+            committed: commitInfo.committed,
+            turnConfigApplied: commitInfo.turnConfigApplied,
             mode: reqMode,
             prompt: body.prompt,
           });
@@ -4290,7 +4403,7 @@ async function handleApi(req, res) {
           cursor: formatCursor(cursorBefore),
           status: st.status,
           ownerConversationId: st.ownerConversationId,
-          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model },
+          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model, effort: st.effort },
           logPath: st.logPath,
         };
       });
@@ -4337,7 +4450,17 @@ async function handleApi(req, res) {
         // Bind routing ONLY on the new forked thread (source thread stays untouched)
         bindNewThreadOwner(st, body.ownerConversationId);
         st.cwd = effCwd || st.cwd;
-        st.model = resData.model || st.model;
+        const nextForkModel = resData.model || st.model;
+        const forkRespEffort = extractResponseEffort(resData);
+        const sourceSt = threads.get(body.threadId);
+        st.model = nextForkModel;
+        if (forkRespEffort !== undefined) {
+          st.effort = forkRespEffort;
+        } else if (sourceSt && nextForkModel && sourceSt.model && nextForkModel === sourceSt.model) {
+          st.effort = sourceSt.effort || null;
+        } else {
+          st.effort = null;
+        }
         st.sandbox = effSandbox || st.sandbox;
         st.approvalPolicy = effApproval || st.approvalPolicy;
         st.name = body.name || resData.thread?.name || st.name;
@@ -4355,6 +4478,7 @@ async function handleApi(req, res) {
           name: st.name,
           cwd: st.cwd,
           model: st.model,
+          effort: st.effort,
           sandbox: st.sandbox,
           approvalPolicy: st.approvalPolicy,
         });
@@ -4367,17 +4491,20 @@ async function handleApi(req, res) {
           if (body.effort) turnParams.effort = body.effort;
           try {
             applyCollaborationMode(turnParams, body, st);
-            const expectedEpoch = st.turnEpoch;
+            const turnCtx = prepareTurnStartContext(st, body);
             const tRes = await rpcCall("turn/start", turnParams);
             turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+            const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fork",
               turnId,
-              model: body.model || st.model,
-              effort: body.effort || null,
+              model: turnCtx.snapshot.model,
+              effort: turnCtx.snapshot.effort,
+              effortExplicit: true,
+              committed: commitInfo.committed,
+              turnConfigApplied: commitInfo.turnConfigApplied,
               mode: reqMode,
               prompt: body.prompt,
             });
@@ -4394,7 +4521,7 @@ async function handleApi(req, res) {
           turnId,
           cursor: formatCursor(cursorBefore),
           status: st.status,
-          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model },
+          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model, effort: st.effort },
           logPath: st.logPath,
         };
       });
@@ -4420,17 +4547,20 @@ async function handleApi(req, res) {
         if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
         applyCollaborationMode(turnParams, body, st);
 
-        const expectedEpoch = st.turnEpoch;
+        const turnCtx = prepareTurnStartContext(st, body);
         const tRes = await rpcCall("turn/start", turnParams);
         const turnId = tRes.turn?.id || tRes.turnId || null;
-        markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+        const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
         if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
         appendThreadLog(st, {
           kind: "supervisor_prompt",
           action: "send",
           turnId,
-          model: body.model || st.model,
-          effort: body.effort || null,
+          model: turnCtx.snapshot.model,
+          effort: turnCtx.snapshot.effort,
+          effortExplicit: true,
+          committed: commitInfo.committed,
+          turnConfigApplied: commitInfo.turnConfigApplied,
           mode: reqMode,
           prompt: body.prompt,
         });
@@ -4464,20 +4594,23 @@ async function handleApi(req, res) {
         if (!expectedTurnId) {
           if (body.fallbackSend && !explicitTurnId) {
             const cursorBefore = st.nextSeq - 1;
-            const expectedEpoch = st.turnEpoch;
+            const turnCtx = prepareTurnStartContext(st, body, { model: st.model, effort: st.effort });
             const tRes = await rpcCall("turn/start", {
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+            const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
               turnId,
-              model: st.model,
-              effort: null,
+              model: turnCtx.snapshot.model,
+              effort: turnCtx.snapshot.effort,
+              effortExplicit: true,
+              committed: commitInfo.committed,
+              turnConfigApplied: commitInfo.turnConfigApplied,
               prompt: body.prompt,
             });
             return {
@@ -4520,20 +4653,23 @@ async function handleApi(req, res) {
           // and the RPC error explicitly indicates no active turn (never on timeout or turn mismatch).
           if (body.fallbackSend && !explicitTurnId && !st.activeTurnId && isNoActiveTurnError(err)) {
             const fbCursorBefore = st.nextSeq - 1;
-            const expectedEpoch = st.turnEpoch;
+            const turnCtx = prepareTurnStartContext(st, body, { model: st.model, effort: st.effort });
             const tRes = await rpcCall("turn/start", {
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
             const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId, expectedEpoch);
+            const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
               turnId,
-              model: st.model,
-              effort: null,
+              model: turnCtx.snapshot.model,
+              effort: turnCtx.snapshot.effort,
+              effortExplicit: true,
+              committed: commitInfo.committed,
+              turnConfigApplied: commitInfo.turnConfigApplied,
               prompt: body.prompt,
             });
             return {

@@ -316,7 +316,7 @@
     const liveModelSub = $("live-model-sub");
     if (status === "running") {
       liveBox.classList.remove("hidden");
-      const mSub = meta.lastModelSub || meta.model || "";
+      const mSub = "lastModelSub" in meta ? (meta.lastModelSub || "") : (meta.model || "");
       if (liveModelSub) {
         liveModelSub.textContent = mSub;
         liveModelSub.classList.toggle("hidden", !mSub);

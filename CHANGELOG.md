@@ -22,6 +22,11 @@ All notable changes to **Codex Supervisor** are documented in this file.
   - Enforces single-reply authority on server requests with exact `0.169.1` retirement/cancel payloads (`{ permissions: {}, scope: "turn" }` for permissions, `{ decision: "abort" }` for legacy approvals, `{ decision: "cancel" }` for v2 approvals, `-32602` on malformed requests) and distinguishes non-blocking `item/tool/requestUserInput` (`isBlocking: false`).
   - Upgraded `POST /wait` validation to strict non-coercing JSON integers and two-phase disconnect cleanup across multi-thread teardown.
 
+### Fixed
+- **Per-Turn Reasoning Effort Tracking & Sidecar Display (`bridge-daemon.mjs`, `sidecars/codex_panel/main.mjs`, `sidecars/codex_panel/app.js`)**:
+  - Tracks thread-level `(model, effort)` separately from active-turn snapshots (`activeTurnModel`, `activeTurnEffort`), reading `reasoningEffort` from `thread/start|resume|fork`, clearing stale effort on cross-model switches, and preventing same-turn appends or rejected `turn/start` responses from relabeling an already-running turn.
+  - Upgraded sidecar log parsing to a two-pass per-turn index with explicit `effortExplicit`/`committed`/`turnConfigApplied` handling, atomic live-bubble scope resolution, and ETag inclusion of `effort` / `lastModelSub` so follow-up turns and legacy logs consistently display their true reasoning effort.
+
 ### Upgrade Notes
 - Finish active tasks and run `codex-ctl.mjs stop` so the bridge restarts on the v1.4.1 daemon advertising `capabilities.stallWatchdog: true`.
 

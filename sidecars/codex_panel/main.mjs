@@ -240,6 +240,18 @@ function formatUserInputRequest(data) {
     .join("\n\n");
 }
 
+function formatModelSub(model, effort) {
+  return [model, effort ? `effort:${effort}` : null].filter(Boolean).join(" · ") || null;
+}
+
+function resolveLiveModelSub(live, fallbackModel, fallbackEffort) {
+  const isRunningLive = live.status === "running" || live.status === "waiting_input";
+  if (isRunningLive && "activeTurnModel" in live && "activeTurnEffort" in live) {
+    return formatModelSub(live.activeTurnModel || null, live.activeTurnEffort || null);
+  }
+  return formatModelSub(fallbackModel, fallbackEffort);
+}
+
 // Per-file parse cache keyed by threadId + file version + fallback meta
 const parsedLogCache = new Map();
 
@@ -270,7 +282,20 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
     meta.status = live.status || meta.status;
     if (live.name) meta.name = live.name;
     if (live.cwd) meta.cwd = cleanWinPath(live.cwd);
-    if (live.model) meta.model = live.model;
+    const prevMetaModel = meta.model;
+    const liveModel = live.model || meta.model || null;
+    const modelChanged = Boolean(live.model && prevMetaModel && live.model !== prevMetaModel);
+    let liveEffort;
+    if ("effort" in live) {
+      liveEffort = live.effort || null;
+    } else if (modelChanged) {
+      liveEffort = null;
+    } else {
+      liveEffort = meta.effort || null;
+    }
+    meta.model = liveModel;
+    meta.effort = liveEffort;
+    meta.lastModelSub = resolveLiveModelSub(live, liveModel, liveEffort);
     if (live.sandbox) meta.sandbox = live.sandbox;
     inFlightDraft = live.inFlightDraft || "";
     meta.pendingRequestsCount = live.pendingRequestsCount || 0;
@@ -287,11 +312,23 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = raw.split(/\r?\n/);
 
+  const records = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line);
+      if (rec && typeof rec === "object" && !Array.isArray(rec)) records.push(rec);
+    } catch {
+      continue;
+    }
+  }
+
   const meta = {
     threadId,
     name: titleHint || null,
     cwd: dbFallback?.cwd || null,
     model: dbFallback?.model || null,
+    effort: null,
     sandbox: null,
     approvalPolicy: null,
     status: "idle",
@@ -300,37 +337,91 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     size: st.size,
   };
 
+  // Pass 1: build authoritative per-turn (model, effort) map before rendering messages
+  // so out-of-order notifications written before supervisor_prompt never inherit another turn's tag.
+  const turnModelSub = new Map();
+  let currentModel = meta.model;
+  let currentEffort = null;
+  let hasExplicitEffortMeta = false;
+  let hasPromptRecords = false;
+  let lastModelSub = formatModelSub(meta.model, null);
+
+  for (const rec of records) {
+    if (rec.kind === "thread_meta") {
+      const prevModel = currentModel;
+      if (rec.name) meta.name = rec.name;
+      if (rec.cwd) meta.cwd = rec.cwd;
+      if (rec.model) {
+        meta.model = rec.model;
+        currentModel = rec.model;
+      }
+      if ("effort" in rec) {
+        hasExplicitEffortMeta = true;
+        meta.effort = rec.effort || null;
+        currentEffort = meta.effort;
+      } else if (rec.model && prevModel && rec.model !== prevModel) {
+        meta.effort = null;
+        currentEffort = null;
+      }
+      if (rec.sandbox) meta.sandbox = rec.sandbox;
+      if (rec.approvalPolicy) meta.approvalPolicy = rec.approvalPolicy;
+      if (currentModel) {
+        lastModelSub = formatModelSub(currentModel, currentEffort);
+      }
+    } else if (rec.kind === "supervisor_prompt") {
+      hasPromptRecords = true;
+      // Rejected/missing-turnId requests are still shown as user messages in Pass 2,
+      // but must NEVER mutate effective thread/turn model or effort state.
+      if (rec.committed === false) continue;
+      const prevModel = currentModel;
+      const effModel = rec.model || currentModel || meta.model || null;
+      const modelChanged = Boolean(rec.model && prevModel && rec.model !== prevModel);
+      let effEffort;
+      if (rec.effort) {
+        effEffort = rec.effort;
+      } else if (rec.effortExplicit === true) {
+        effEffort = null;
+      } else if (hasExplicitEffortMeta && "effort" in rec) {
+        effEffort = null;
+      } else if (modelChanged) {
+        effEffort = null;
+      } else {
+        effEffort = currentEffort;
+      }
+      currentModel = effModel;
+      currentEffort = effEffort || null;
+      if (effModel) meta.model = effModel;
+      meta.effort = currentEffort;
+      const subStr = formatModelSub(effModel, effEffort);
+      if (rec.turnConfigApplied !== false) {
+        if (subStr) lastModelSub = subStr;
+        if (rec.turnId && !turnModelSub.has(rec.turnId)) {
+          turnModelSub.set(rec.turnId, subStr);
+        }
+      }
+    }
+  }
+
+  const promptlessFallbackSub = hasPromptRecords ? null : formatModelSub(meta.model, meta.effort);
   const messages = [];
   let seq = 0;
   let lastFinalTextByTurn = new Map();
-  let turnModelSub = new Map();
-  let lastModelSub = dbFallback?.model || null;
   let lastErrorText = null;
   let sawFileChangeDetail = false;
 
-  const resolveModelSub = (turnId) => (turnId && turnModelSub.get(turnId)) || lastModelSub || meta.model || null;
+  // Never attribute unmapped/unknown turns in prompted logs to the latest turn's model/effort
+  const resolveModelSub = (turnId) => {
+    if (turnId && turnModelSub.has(turnId)) return turnModelSub.get(turnId);
+    return promptlessFallbackSub;
+  };
   const joinSub = (...parts) => parts.filter(Boolean).join(" · ") || null;
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
-
+  // Pass 2: render timeline messages using the pre-built turn index
+  for (const rec of records) {
     const kind = rec.kind;
     const ts = rec.ts || null;
 
     if (kind === "thread_meta") {
-      if (rec.name) meta.name = rec.name;
-      if (rec.cwd) meta.cwd = rec.cwd;
-      if (rec.model) meta.model = rec.model;
-      if (rec.sandbox) meta.sandbox = rec.sandbox;
-      if (rec.approvalPolicy) meta.approvalPolicy = rec.approvalPolicy;
-      if (meta.model && !lastModelSub) lastModelSub = meta.model;
       continue;
     }
 
@@ -342,15 +433,6 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         fork: "分叉续聊",
         fallback_send: "插队转新轮",
       };
-      const extraTags = [];
-      const effModel = rec.model || meta.model || null;
-      if (effModel) extraTags.push(effModel);
-      if (rec.effort) extraTags.push(`effort:${rec.effort}`);
-      const subStr = extraTags.join(" · ") || null;
-      if (subStr) {
-        lastModelSub = subStr;
-        if (rec.turnId) turnModelSub.set(rec.turnId, subStr);
-      }
       const baseBadge = actionMap[rec.action] || "发送指令";
       messages.push({
         id: ++seq,
@@ -694,7 +776,7 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
   return {
     meta: {
       ...meta,
-      lastModelSub: lastModelSub || meta.model || null,
+      lastModelSub: lastModelSub || formatModelSub(meta.model, meta.effort),
       visibleCount: coreCount,
       processCount: narrationCount + toolCount,
       counts: { core: coreCount, narration: narrationCount, tool: toolCount },
@@ -778,11 +860,14 @@ app.api(
     }
     for (const [tid, live] of liveMap.entries()) {
       if (seen.has(tid)) continue;
+      const liveEffort = "effort" in live ? (live.effort || null) : null;
       sessions.unshift({
         threadId: tid,
         name: live.name || titleMap.get(tid) || `会话 ${tid.slice(0, 8)}`,
         cwd: cleanWinPath(live.cwd),
         model: live.model,
+        effort: liveEffort,
+        lastModelSub: resolveLiveModelSub(live, live.model || null, liveEffort),
         sandbox: live.sandbox,
         status: live.status || "running",
         updatedAt: new Date().toISOString(),
@@ -823,7 +908,7 @@ app.api(
     }
 
     const sessionSig = sessions
-      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.sandbox || ""}:${s.visibleCount}`)
+      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.effort || ""}:${s.lastModelSub || ""}:${s.sandbox || ""}:${s.visibleCount}`)
       .join(",");
     const draftSig = active?.inFlightDraft || "";
     const etag = [
@@ -831,6 +916,7 @@ app.api(
       sessionSig,
       activeId || "",
       active?.meta?.status || "",
+      active?.meta?.lastModelSub || "",
       active?.meta?.pendingRequestsCount || 0,
       draftSig,
     ].join("|");
