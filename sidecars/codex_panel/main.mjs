@@ -278,6 +278,7 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
   const live = liveMap.get(threadId);
   const meta = { ...base.parsed.meta, isLive: Boolean(live), pendingRequestsCount: 0 };
   let inFlightDraft = "";
+  let inFlightDraftItemIds = [];
   if (live) {
     meta.status = live.status || meta.status;
     if (live.name) meta.name = live.name;
@@ -298,11 +299,34 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
     meta.lastModelSub = resolveLiveModelSub(live, liveModel, liveEffort);
     if (live.sandbox) meta.sandbox = live.sandbox;
     inFlightDraft = live.inFlightDraft || "";
+    const rawDraftIds = Array.isArray(live.inFlightDraftItemIds)
+      ? live.inFlightDraftItemIds.filter((id) => typeof id === "string" && id.length > 0)
+      : [];
+    inFlightDraftItemIds = rawDraftIds;
     meta.pendingRequestsCount = live.pendingRequestsCount || 0;
+    const activeItemsCount = Number(live.activeItemsTotal || 0);
+    const activeItemsArr = Array.isArray(live.activeItems) ? live.activeItems : [];
+    const hasNonMessageActiveItem =
+      activeItemsCount > activeItemsArr.length ||
+      activeItemsArr.some((it) => it && it.type !== "agentMessage");
+    if (inFlightDraft && rawDraftIds.length > 0) {
+      // Exact itemId check: only clear snapshot-race draft when EVERY draft itemId is already persisted on disk
+      const allCompleted = rawDraftIds.every((id) => base.parsed.completedMessageItemIds?.has(id));
+      if (allCompleted) {
+        inFlightDraft = "";
+        inFlightDraftItemIds = [];
+      }
+    }
+    meta.activeTurnFinalized = Boolean(
+      live.activeTurnId &&
+      !hasNonMessageActiveItem &&
+      base.parsed.finalizedTurns?.has(live.activeTurnId)
+    );
   }
   return {
     meta,
     inFlightDraft,
+    inFlightDraftItemIds,
     lastErrorText: base.parsed.lastErrorText,
     messages: base.parsed.messages,
   };
@@ -406,6 +430,8 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
   const messages = [];
   let seq = 0;
   let lastFinalTextByTurn = new Map();
+  let completedMessageItemIds = new Set();
+  let finalizedTurns = new Set();
   let lastErrorText = null;
   let sawFileChangeDetail = false;
 
@@ -423,6 +449,21 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
 
     if (kind === "thread_meta") {
       continue;
+    }
+
+    if (
+      rec.turnId &&
+      (kind === "supervisor_prompt" ||
+        kind === "steer_sent" ||
+        kind === "message_supervisor_call" ||
+        kind === "event:approval_request" ||
+        kind === "event:user_input_request" ||
+        kind === "fileChange_detail" ||
+        kind === "event:file_changed" ||
+        kind === "commandExecution" ||
+        kind === "toolExecution")
+    ) {
+      finalizedTurns.delete(rec.turnId);
     }
 
     if (kind === "supervisor_prompt") {
@@ -500,8 +541,14 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
       const txt = String(rec.text || "").trim();
       if (!txt) continue;
       if (!isCommentary && rec.turnId) lastFinalTextByTurn.set(rec.turnId, txt);
-      messages.push({
+      if (rec.turnId) {
+        if (rec.phase === "final_answer") finalizedTurns.add(rec.turnId);
+        else finalizedTurns.delete(rec.turnId);
+      }
+      if (rec.itemId && rec.itemId !== "_default") completedMessageItemIds.add(rec.itemId);
+      const msgObj = {
         id: ++seq,
+        itemId: rec.itemId || null,
         side: "codex",
         tier: isCommentary ? "narration" : "core",
         badge: isCommentary ? "过程说明" : "Codex 回复",
@@ -509,7 +556,8 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         sub: resolveModelSub(rec.turnId),
         ts,
         text: txt,
-      });
+      };
+      messages.push(msgObj);
       continue;
     }
 
@@ -678,7 +726,10 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     if (kind === "plan_item") {
       const txt = String(rec.text || "").trim();
       if (txt) {
-        if (rec.turnId) lastFinalTextByTurn.set(rec.turnId, txt);
+        if (rec.turnId) {
+          lastFinalTextByTurn.set(rec.turnId, txt);
+          finalizedTurns.delete(rec.turnId);
+        }
         messages.push({
           id: ++seq,
           side: "codex",
@@ -782,6 +833,8 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
       counts: { core: coreCount, narration: narrationCount, tool: toolCount },
     },
     lastErrorText,
+    finalizedTurns,
+    completedMessageItemIds,
     messages,
   };
 }
@@ -916,6 +969,7 @@ app.api(
       sessionSig,
       activeId || "",
       active?.meta?.status || "",
+      active?.meta?.activeTurnFinalized ? 1 : 0,
       active?.meta?.lastModelSub || "",
       active?.meta?.pendingRequestsCount || 0,
       draftSig,

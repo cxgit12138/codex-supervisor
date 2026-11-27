@@ -2290,6 +2290,9 @@ function buildCompactSummary(st) {
     inFlightDraft: st.deltaBuffers.size > 0
       ? truncateText(Array.from(st.deltaBuffers.values()).join("\n"), 500)
       : "",
+    inFlightDraftItemIds: st.deltaBuffers.size > 0
+      ? Array.from(st.deltaBuffers.keys())
+      : [],
     turnFiles: Array.from(st.turnFiles),
     turnCommandsCount: st.turnCommands.length,
     recentCommands: st.turnCommands.slice(-5),
@@ -2621,7 +2624,7 @@ function handleServerNotification(msg) {
       st.lastMessage = text;
       st.lastMessageTurnId = turnId || null;
       st.lastPhase = item.phase || null;
-      appendThreadLog(st, { kind: "agentMessage_full", turnId, phase: item.phase || null, text, questions: item.questions || null });
+      appendThreadLog(st, { kind: "agentMessage_full", turnId, itemId: item.id || null, phase: item.phase || null, text, questions: item.questions || null });
       // `final_answer` is always immediately followed by `turn/completed` (which already carries `lastMessage`);
       // mark it `info` so we never double-wake the supervisor on final responses.
       const msgLevel = item.phase === "final_answer" ? "info" : "milestone";

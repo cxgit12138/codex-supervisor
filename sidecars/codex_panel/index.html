@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Codex Supervisor</title>
   <script src="/preload.js"></script>
-  <link rel="stylesheet" href="./styles.css?v=1.4.1">
+  <link rel="stylesheet" href="./styles.css?v=1.4.1-4">
 </head>
 <body>
   <div class="shell">
@@ -13,9 +13,24 @@
     <header class="topbar">
       <div class="session-row">
         <span id="status-dot" class="dot dot-idle" title="会话状态"></span>
-        <select id="session-select" class="session-select" aria-label="切换 Codex 会话">
-          <option value="">正在加载会话…</option>
-        </select>
+        <div id="session-picker" class="session-picker">
+          <button
+            type="button"
+            id="session-trigger"
+            class="session-trigger"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+            aria-controls="session-menu"
+            aria-label="切换 Codex 会话"
+          >
+            <span id="session-trigger-title" class="session-trigger-title">正在加载会话…</span>
+            <span id="session-trigger-count" class="session-trigger-count hidden"></span>
+            <svg class="session-trigger-caret" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6l4 4 4-4"/>
+            </svg>
+          </button>
+          <div id="session-menu" class="session-menu hidden" role="listbox" tabindex="-1" aria-label="Codex 会话列表"></div>
+        </div>
         <button type="button" id="refresh-btn" class="icon-btn" title="立即刷新">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7"/>
@@ -59,6 +74,6 @@
     <button type="button" id="scroll-bottom-btn" class="scroll-btn hidden" title="回到最新消息">↓ 最新消息</button>
   </div>
 
-  <script src="./app.js?v=1.4.1"></script>
+  <script src="./app.js?v=1.4.1-4"></script>
 </body>
 </html>
