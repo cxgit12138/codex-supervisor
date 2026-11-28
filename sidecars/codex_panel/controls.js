@@ -25,7 +25,8 @@ function panelControls(api, saveSession) {
   }
   function drawSession() {
     if (!catalog || !home || savingSession) return;
-    const { current, selection, defaults } = home;
+    const { selection, defaults } = home;
+    const current = home.suggested ? undefined : home.current;
     const model = selection.pending || !current ? selection.model || "" : current.model || "";
     const effort = selection.pending || !current ? selection.effort || "" : current.effort || "";
     const defaultModel = defaults.model || catalog.configuredModel;

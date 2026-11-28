@@ -4,7 +4,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { gunzipSync } from "node:zlib";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { boundThread, stateDir, readSettings } from "../lib/preferences.mjs";
+import { boundThread, stateDir } from "../lib/preferences.mjs";
 import { readPanelState } from "../sidecars/codex_panel/main.mjs";
 
 import { panelActions, panelHtml } from "../sidecars/codex_panel/api.mjs";
@@ -55,15 +55,16 @@ export async function handle(method, params = {}, id) {
         return { isError: true, content: [{ type: "text", text: err.message }] };
       }
     }
-    const threadId = params.arguments?.threadId || boundThread(stateDir, params.arguments?.conversationId);
     if (params.name === "open_thread") {
-      if (id != null && threadId) {
-        opened.set(id, threadId);
+      const conversationId = params.arguments?.conversationId;
+      const threadId = params.arguments?.threadId || boundThread(stateDir, conversationId);
+      if (id != null) {
+        opened.delete(id);
+        if (threadId) opened.set(id, threadId);
         if (opened.size > 128) opened.delete(opened.keys().next().value);
       }
-      const { model, effort } = readSettings();
       return { content: [{ type: "text", text: threadId ? "已选择监管线程 " + threadId : "当前对话尚未派单" }],
-        structuredContent: { threadId, defaultModel: model, defaultEffort: effort } };
+        structuredContent: { threadId, conversationId } };
     }
   }
   throw Object.assign(new Error("不支持此请求：" + method), { code: -32601 });

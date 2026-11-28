@@ -5,8 +5,8 @@
   "version": "1.5.0",
   "description": "Dispatch and supervise local OpenAI Codex sessions via codex app-server with mid-turn steering, native message_supervisor bidirectional comms, live side-pane chat viewer, thread forking, zero-polling wakeups, and automatic between-turn hook notifications.",
   "author": "cxgit12138",
-  "homepage": "https://github.com/MaLinYu/codex-supervisor",
-  "repository": "https://github.com/MaLinYu/codex-supervisor",
+  "homepage": "https://github.com/cxgit12138/codex-supervisor",
+  "repository": "https://github.com/cxgit12138/codex-supervisor",
   "license": "MIT",
   "keywords": [
     "codex",

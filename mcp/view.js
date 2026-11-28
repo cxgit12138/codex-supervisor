@@ -7,7 +7,7 @@ function startPanel(host) {
   });
   let lastBinding, lastHostThread, etag = "", selected = false;
   const controls = panelControls((name, args) => call(name.replace("-", "_"), args), async (home, patch) => {
-    const scope = { conversationId: host.conversation?.(), threadId: home.current?.threadId };
+    const scope = { conversationId: host.conversation?.(), threadId: home.suggested ? undefined : home.current?.threadId };
     if (!scope.threadId && !scope.conversationId) {
       if (!host.handoff) throw new Error("请在具体对话中选择会话设置");
       scope.sessionKey = host.sessionKey;
@@ -49,7 +49,10 @@ function startPanel(host) {
         $("sync").textContent = "项目自动同步 · " + (home.syncReady ? "已开启" : "待启动");
         controls.syncSession(home);
         const current = home.current;
-        $("binding-badge").textContent = current ? "已绑定" : "待派单";
+        $("binding-badge").textContent = current ? (home.suggested ? "唯一运行中" : "已绑定") :
+          (home.contextKnown ? "待派单" : "未定位");
+        $("unbound").textContent = home.contextKnown ? "尚未关联 Codex 会话，左侧发送任务后自动绑定" :
+          "宿主未提供当前对话标识，可从最近监管会话中打开";
         $("unbound").hidden = Boolean(current);
         $("current-card").hidden = !current;
         if (current) {

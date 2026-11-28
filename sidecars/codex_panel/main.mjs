@@ -871,8 +871,6 @@ function listLogFiles() {
 }
 
 export async function readPanelState(data) {
-    const binding = boundThread(STATE_DIR, data.conversationId);
-    const requestedThread = binding && binding !== data.knownBinding ? binding : data.threadId || binding;
     const liveStatus = await fetchLiveDaemonStatus();
     const liveMap = new Map();
     if (liveStatus && Array.isArray(liveStatus.threads)) {
@@ -884,6 +882,22 @@ export async function readPanelState(data) {
         liveMap.set(t.threadId, { ...t, pendingRequestsCount: pendingByThread.get(t.threadId) || 0 });
       }
     }
+
+    const { conversationId } = data;
+    let binding = boundThread(STATE_DIR, conversationId);
+    const owner = liveMap.get(binding)?.ownerConversationId;
+    if (owner && owner !== conversationId) binding = null;
+    const owned = [...liveMap.values()].filter(thread => thread.ownerConversationId &&
+      (!conversationId || thread.ownerConversationId === conversationId));
+    const activeOwned = owned.filter(thread => thread.status === "running" || thread.status === "waiting_input");
+    if (conversationId && !binding) {
+      const candidates = activeOwned.length ? activeOwned : owned;
+      if (candidates.length === 1) binding = candidates[0].threadId;
+    }
+    const suggestedThread = data.suggestOwned && !conversationId && !data.threadId && activeOwned.length === 1
+      ? activeOwned[0].threadId : null;
+    const requestedThread = !data.preferRequested && binding && binding !== data.knownBinding
+      ? binding : data.threadId || binding || suggestedThread;
 
     const titleMap = getSessionTitleMap();
     const allLogs = listLogFiles();
@@ -975,12 +989,13 @@ export async function readPanelState(data) {
     ])).digest("hex");
 
     if (data.etag && data.etag === etag) {
-      return { unchanged: true, etag };
+      return { unchanged: true, etag, binding };
     }
 
     return {
       etag,
       binding,
+      suggestedThread,
       daemonOnline: Boolean(liveStatus),
       sessions,
       activeThreadId: activeId,

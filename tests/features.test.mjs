@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import vm from "node:vm";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -22,6 +23,11 @@ const { handle } = await import("../mcp/server.mjs");
 const { readPanelState } = await import("../sidecars/codex_panel/main.mjs");
 const { available, compareVersions, updater } = await import("../lib/update.mjs");
 after(() => fs.rmSync(tmp, { recursive: true, force: true }));
+
+function removeBinding(conversationId) {
+  const file = createHash("sha256").update(conversationId).digest("hex") + ".json";
+  fs.unlinkSync(path.join(stateDir, "bindings", file));
+}
 
 test("共享设置支持跟随、覆盖和显式参数", () => {
   assert.deepEqual(readSettings(), { model: "", effort: "", openDesktop: true });
@@ -252,6 +258,8 @@ test("MCP 待机页读写共享配置、最近五项，以及按提交忽略更�
   await handle("tools/call", { name: "open_thread", arguments: { threadId: "alpha" } }, 101);
   await handle("tools/call", { name: "open_thread", arguments: { threadId: "beta" } }, 102);
   assert.equal((await call("home", {callId: 101})).openedThread, "alpha");
+  await handle("tools/call", { name: "open_thread", arguments: {} }, 101);
+  assert.equal((await call("home", {callId: 101})).openedThread, undefined);
   assert.equal((await call("home", {conversationId: "b"})).binding, "beta");
   assert.equal((await call("home")).binding, null);
   assert.equal((await call("open_thread", {conversationId: "a"})).threadId, "alpha");
@@ -291,21 +299,32 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     assert.equal(models.configuredModel, "mock-model");
     const catalog = await handle("tools/call", { name: "models" });
     assert.deepEqual(catalog.structuredContent, models);
+    const panel = async (name, args) => {
+      const r = await handle("tools/call", { name, arguments: args });
+      assert.ok(!r.isError, JSON.stringify(r.content));
+      return r.structuredContent;
+    };
     const a = cli("start", "--cwd", fixture, "--prompt", "stay_running");
-    assert.equal(boundThread(stateDir, env.ANTIGRAVITY_CONVERSATION_ID), a.threadId);
+    const owner = env.ANTIGRAVITY_CONVERSATION_ID;
+    assert.equal(boundThread(stateDir, owner), a.threadId);
+    removeBinding(owner); // 模拟旧版已有运行归属、没有持久绑定。
+    assert.equal((await panel("home", { conversationId: owner })).binding, a.threadId);
+    const manual = await panel("home", {});
+    assert.equal(manual.current.threadId, a.threadId);
+    assert.equal(manual.suggested, true);
+    assert.equal(manual.binding, null);
+    assert.ok(manual.recent.every(row => row.threadId !== a.threadId));
+    assert.equal(boundThread(stateDir, owner), null);
+    assert.equal((await panel("home", { conversationId: "different-conversation" })).current, undefined);
     cli("steer", a.threadId, "--prompt", "keep going");
     cli("start", "--model", "explicit", "--effort", "low", "--cwd", fixture, "--prompt", "stay_running");
+    assert.equal((await panel("home", {})).current, undefined);
     const calls = fs.readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse);
     assert.equal(calls.filter(c => c.method === "project/create").length, 1);
     const starts = calls.filter(c => c.method === "thread/start").map(c => c.params);
     assert.deepEqual(starts.map(p => [p.projectId, p.model, p.config.model_reasoning_effort]), [
       ["codex-project", "worker", "high"], ["codex-project", "explicit", "low"] ]);
     assert.deepEqual(calls.filter(c => c.method === "turn/start").map(c => c.params.effort), ["high", "low"]);
-    const panel = async (name, args) => {
-      const r = await handle("tools/call", { name, arguments: args });
-      assert.ok(!r.isError, JSON.stringify(r.content));
-      return r.structuredContent;
-    };
     const globalBefore = readSettings();
     const preferred = "gpt-6.2-astra";
     const logCalls = method => fs.readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse).filter(c => c.method === method);
@@ -362,6 +381,26 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     const fork = cli("fork", linked.threadId, "--effort", "high", "--prompt", "fork");
     assert.deepEqual([lastTurn().model, lastTurn().effort], ["gpt-6.2-sol", "high"]);
     assert.equal(cli("status", fork.threadId).summary.effort, "high");
+    assert.equal(boundThread(stateDir, owner), fork.threadId);
+
+    const transferred = cli("fork", fork.threadId);
+    assert.equal(boundThread(stateDir, owner), transferred.threadId);
+    const claimant = "claiming-conversation";
+    const claimed = runIn(claimant, ["resume", transferred.threadId, "--claim"]);
+    assert.equal(claimed.ownerConversationId, claimant);
+    assert.equal(boundThread(stateDir, owner), null);
+    assert.equal(boundThread(stateDir, claimant), transferred.threadId);
+    removeBinding(claimant);
+    runIn(claimant, ["send", transferred.threadId, "--prompt", "stay_running"]);
+    assert.equal(boundThread(stateDir, claimant), transferred.threadId);
+    cli("send", transferred.threadId, "--prompt", "append_same_turn");
+    assert.equal(boundThread(stateDir, owner), null);
+    assert.equal(boundThread(stateDir, claimant), transferred.threadId);
+    bindThread(stateDir, "owner-before-restart", "previous-bridge-thread");
+    const inherited = runIn(claimant, ["resume", "previous-bridge-thread", "--claim"]);
+    assert.equal(inherited.ownerConversationId, claimant);
+    assert.equal(boundThread(stateDir, "owner-before-restart"), null);
+    assert.equal(boundThread(stateDir, claimant), "previous-bridge-thread");
     cli("send", linked.threadId, "--prompt", "test-settings");
     const reported = cli("status", linked.threadId).summary;
     assert.deepEqual([reported.model, reported.effort], ["reported-model", "medium"]);
@@ -380,6 +419,15 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     assert.equal(afterFailure.current.model, "routed-model");
     assert.deepEqual(afterFailure.selection, { model: "gpt-6.2-sol", effort: "max" });
     const post = route => fetch("http://127.0.0.1:" + state.port + route, { method: "POST", headers: { Authorization: "Bearer " + state.token } });
+    cli("send", linked.threadId, "--model", "low-only", "--prompt", "switch with inherited effort");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["low-only", "low"]);
+    const unmatched = path.join(tmp, "new-workspace");
+    fs.mkdirSync(unmatched);
+    writeJson(path.join(config, "unsupported-project.json"), { id: "unsupported-project", name: "Project API unavailable",
+      projectResources: { resources: [{ folderUri: pathToFileURL(unmatched).href }] } });
+    const dispatched = cli("start", "--cwd", unmatched, "--prompt", "works without project mapping");
+    assert.ok(dispatched.threadId);
+    assert.equal(logCalls("thread/start").at(-1).params.projectId, undefined);
     assert.equal((await post("/update-idle")).status, 409);
     writeJson(path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor/install-" + process.pid + ".lock"), process.pid);
     assert.equal((await post("/start")).status, 409);
@@ -408,6 +456,11 @@ test("手动更新通过真实 ZIP 完成安装，外部偏好保留，同一包
   const service = updater(target, releases, (_, zip) => fs.copyFileSync(path.join(build, manifest.assetName), zip));
   assert.equal((await service.check(true)).available, true);
   await assert.rejects(service.install("old-check"), /重新检查/);
+  const gitFile = path.join(target, ".git");
+  fs.writeFileSync(gitFile, "gitdir: ../fixture");
+  await assert.rejects(service.install(commit), /git pull/);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(target, "plugin.json"))).version, "1.4.0");
+  fs.unlinkSync(gitFile);
   const replaced = path.join(target, "install-info.json");
   const race = updater(target, releases, (_, zip) => {
     fs.copyFileSync(path.join(build, manifest.assetName), zip);

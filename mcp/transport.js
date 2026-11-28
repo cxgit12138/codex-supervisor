@@ -17,10 +17,11 @@ const panel = startPanel({
 // 先接收工具参数，再握手。空的结果不能撤销已经选中的线程。
 app.ontoolinput = ({ arguments: args }) => {
   const input = args?.Arguments || args;
-  invocationConversation = input?.conversationId || invocationConversation;
+  if (input?.conversationId || input?.threadId) invocationConversation = input.conversationId;
   panel.hostThread(input?.threadId, true);
 };
 app.ontoolresult = result => {
+  if (result.structuredContent?.conversationId) invocationConversation = result.structuredContent.conversationId;
   let id = result.structuredContent?.threadId;
   for (const block of result.content || []) {
     if (id || block.type !== "text") continue;

@@ -62,6 +62,19 @@ class PackageTest(unittest.TestCase):
             self.apply(self.manifest)
         self.assertEqual(release.manifest_at(self.install)["version"], "1.3.2")
 
+    def test_git_checkout_is_left_intact(self):
+        git_file = self.install / ".git"
+        git_file.write_text("gitdir: ../fixture")
+        with self.assertRaisesRegex(ValueError, "git pull"):
+            self.apply(self.manifest)
+        self.assertEqual(git_file.read_text(), "gitdir: ../fixture")
+        self.assertEqual(release.manifest_at(self.install)["version"], "1.3.2")
+
+    def test_pack_rejects_linked_runtime_directory(self):
+        with patch.object(release, "linked", side_effect=lambda file: file == ROOT / "mcp"):
+            with self.assertRaisesRegex(ValueError, "运行文件包含链接"):
+                release.pack(ROOT, self.work, "a" * 40, "latest")
+
     def test_switch_failure_restores_old_install(self):
         rename = os.rename
 
@@ -117,6 +130,34 @@ class PackageTest(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 release.activate_in_place(self.install, stage, self.work / "backup")
         self.assertEqual(before, {p.relative_to(self.install): p.read_bytes() for p in self.install.rglob("*") if p.is_file()})
+        self.assertFalse((self.install / "mcp").exists())
+
+    def test_rollback_attempts_other_files_when_one_is_locked(self):
+        hooks = self.install / "hooks.json"
+        hooks.write_text("original hooks")
+        usage = self.install / "lib/usage.mjs"
+        usage.parent.mkdir()
+        usage.write_text("original usage")
+        stage = self.work / "stage"
+        release.stage_package(self.zip, self.manifest, stage)
+        backup = self.work / "backup"
+        replace = os.replace
+        rolling_back = False
+
+        def locked_files(src, dest):
+            nonlocal rolling_back
+            if dest == self.install / "plugin.json":
+                rolling_back = True
+                raise PermissionError("安装时占用")
+            if rolling_back and dest == usage:
+                raise PermissionError("回滚时占用")
+            replace(src, dest)
+
+        with patch.object(os, "replace", side_effect=locked_files):
+            with self.assertRaisesRegex(OSError, "完整备份位于"):
+                release.activate_in_place(self.install, stage, backup)
+        self.assertEqual(hooks.read_text(), "original hooks")
+        self.assertEqual((backup / "lib/usage.mjs").read_text(), "original usage")
         self.assertFalse((self.install / "mcp").exists())
 
     def test_tag_must_match_manifest(self):

@@ -57,14 +57,17 @@ rl.on("line", (line) => {
   }
   if (method === "config/read") return send({ id, result: { config: { model: "mock-model", model_reasoning_effort: "low" } } });
   if (method === "project/list") return send({ id, result: { data: [] } });
-  if (method === "project/create") return send({ id, result: { project: { id: "codex-project", roots: params.roots } } });
+  if (method === "project/create") {
+    if (params.idempotencyKey === "antigravity:unsupported-project") return send({ id, error: { code: -32601, message: "project unavailable" } });
+    return send({ id, result: { project: { id: "codex-project", roots: params.roots } } });
+  }
   if (method === "initialize") {
     return send({ jsonrpc: "2.0", id, result: { serverInfo: { name: "mock-codex", version: "1.0.0" } } });
   }
   if (method === "initialized") return;
 
   if (method === "model/list") {
-    return send({ jsonrpc: "2.0", id, result: { models: ["mock-model", "gpt-6.2-sol", "gpt-6.2-astra"].map((id, i) => ({ id, isDefault: i === 0, defaultReasoningEffort: "low", supportedReasoningEfforts: (i ? ["low", "high", "max"] : ["high", "low"]).map(reasoningEffort => ({ reasoningEffort })) })) } });
+    return send({ jsonrpc: "2.0", id, result: { models: ["mock-model", "gpt-6.2-sol", "gpt-6.2-astra", "low-only"].map((id, i) => ({ id, isDefault: i === 0, defaultReasoningEffort: "low", supportedReasoningEfforts: (id === "low-only" ? ["low"] : i ? ["low", "high", "max"] : ["high", "low"]).map(reasoningEffort => ({ reasoningEffort })) })) } });
   }
 
   if (method === "thread/start") {

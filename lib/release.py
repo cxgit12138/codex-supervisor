@@ -63,7 +63,10 @@ def pack(root, destination, commit, tag):
         names.update(p.relative_to(root).as_posix() for p in (root / folder).rglob("*") if p.is_file())
     with ZipFile(destination / ASSET, "w", ZIP_DEFLATED) as archive:
         for name in sorted(n for n in names if runtime_file(n)):
-            archive.write(root / name, name)
+            relative = PurePosixPath(name)
+            if any(linked(root / part) for part in (relative, *relative.parents) if part != PurePosixPath(".")):
+                raise ValueError(f"运行文件包含链接：{name}")
+            archive.write(root / relative, name)
         archive.writestr(INFO, json.dumps(info))
         if not complete(archive):
             raise ValueError("运行文件不完整")
@@ -129,15 +132,24 @@ def activate_in_place(root, stage, backup):
             if old.is_file() and runtime_file(rel.as_posix()) and not (stage / rel).exists():
                 (root / rel).unlink()
                 changed.append(root / rel)
-    except OSError:
+    except OSError as install_error:
+        recovery_failed = []
         for dest in reversed(changed):
             old = backup / dest.relative_to(root)
-            if old.exists():
-                replace_file(old, dest)
-            else:
-                dest.unlink()
+            try:
+                if old.exists():
+                    replace_file(old, dest)
+                else:
+                    dest.unlink()
+            except OSError:
+                recovery_failed.append(dest.relative_to(root).as_posix())
         for dest in reversed(created_dirs):
-            dest.rmdir()
+            try:
+                dest.rmdir()
+            except OSError:
+                recovery_failed.append(dest.relative_to(root).as_posix())
+        if recovery_failed:
+            raise OSError(f"回滚未能恢复 {', '.join(recovery_failed)}。完整备份位于 {backup}") from install_error
         raise
 
 
@@ -150,6 +162,8 @@ def activate(root, stage, data_dir):
             raise ValueError("安装目录无效")
     if manifest_at(root)["name"] != "codex-supervisor":
         raise ValueError("安装目录无效")
+    if os.path.lexists(root / ".git"):
+        raise ValueError("通过 Git 安装的插件请使用 git pull 更新")
     backup = data_dir / "backups" / str(uuid4())
     backup.parent.mkdir(exist_ok=True)
     try:

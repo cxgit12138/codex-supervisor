@@ -1,6 +1,6 @@
 # Codex Supervisor for Antigravity
 
-[![Release](https://img.shields.io/github/v/release/MaLinYu/codex-supervisor?color=blue)](https://github.com/MaLinYu/codex-supervisor/releases)
+[![Release](https://img.shields.io/github/v/release/cxgit12138/codex-supervisor?color=blue)](https://github.com/cxgit12138/codex-supervisor/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-green.svg)](https://nodejs.org/)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0-brightgreen.svg)](#)
@@ -13,17 +13,17 @@
 
 ---
 
-## Fork 版设置与更新
+## 设置与更新
 
-主页「当前会话」的选择只影响该对话的下一轮；右侧卡片显示最近实际使用的模型与强度。「设置」管理全局默认和桌面跳转，用量页按本地日期汇总监管日志，更新页从 MaLinYu Fork 检查安装包。设置保存在 `~/.gemini/config/codex-supervisor/settings.json`。GitHub 发布包已包含 MCP 视图 SDK，无需 npm install。按钮安装需要系统 curl 和 Python 3（Windows 使用 python.exe）。
+主页「当前会话」的选择只影响该对话的下一轮；右侧卡片显示最近实际使用的模型与强度。「设置」管理全局默认和桌面跳转，用量页按本地日期汇总监管日志，更新页从 GitHub Releases 检查安装包。设置保存在 `~/.gemini/config/codex-supervisor/settings.json`。GitHub 发布包已包含 MCP 视图 SDK，无需 npm install。按钮安装需要系统 curl 和 Python 3.8+（Windows 使用 python.exe）。需要代理时可设置 HTTPS_PROXY。
 
-主分支构建发布在滚动标签 `latest`，正式标签应与 plugin.json 版本一致，例如 `v1.5.0`。包内 install-info.json 记录提交和版本。安装器保留旧版于同一配置目录下的 backups；更新完成后重启 Antigravity 加载新版 MCP 和 hooks。使用源码目录开发时只检查更新。旧的全局 codex-auto-open 和插件跳转二选一，避免同时拉起桌面。
+主分支构建发布在滚动标签 `latest`，正式标签应与 plugin.json 版本一致，例如 `v1.5.0`。包内 install-info.json 记录提交和版本。安装器保留旧版于同一配置目录下的 backups；更新完成后重启 Antigravity 加载新版 MCP 和 hooks。通过 Git 克隆安装的用户可用 git pull 更新。按钮安装需使用 Release 发布包。更新源取自 plugin.json 的 repository。
 
 ## 中文文档
 
 ### 核心特性
 
-- **原生侧边栏实时对话面板（Sidecar UI）**
+- **MCP Apps 侧栏实时对话面板**
   - 左 Codex / 右 Antigravity 双边气泡流，实时同步派单、插队、主动汇报、审批问答、执行出错与最终回复；
   - 支持 **三档详略切换**（`简洁` 仅核心对话 / `默认` 含过程说明、计划与系统状态 / `详细` 展开全部读取文件、搜索代码、列出目录、执行命令、修改文件、查看图片、网页搜索、MCP 工具、协作子代理等工具调用与可折叠输出）；
   - 顶部显示工作区目录、模型名与沙箱标签，每条 Codex 气泡自动标注当前回合的模型名与思考深度（`model · effort`）；
@@ -51,7 +51,7 @@
 
 ### 环境要求
 
-- **Antigravity**（支持 Plugins 与 Aux Pane Sidecar UI）
+- **Antigravity App**（支持插件与 MCP Apps 侧栏）
 - **Node.js >= 22**
 - 本机已安装并登录 **OpenAI Codex**（以下任一即可）：
   - **Codex Desktop App**（Windows 自动发现 `%LOCALAPPDATA%\OpenAI\Codex\bin\*\codex.exe`，macOS 自动发现 `/Applications/Codex.app/Contents/Resources/codex`）
@@ -64,7 +64,7 @@
 #### 方式一：使用 Antigravity CLI 一键安装（推荐）
 
 ```bash
-agy plugin install https://github.com/MaLinYu/codex-supervisor
+agy plugin install https://github.com/cxgit12138/codex-supervisor
 ```
 
 #### 方式二：手动克隆到全局插件目录（支持锁定 Release 版本）
@@ -73,17 +73,17 @@ agy plugin install https://github.com/MaLinYu/codex-supervisor
 
 ```powershell
 # 安装最新主分支
-git clone https://github.com/MaLinYu/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
+git clone https://github.com/cxgit12138/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
 ```
 
 **macOS / Linux：**
 
 ```bash
 # 安装最新主分支
-git clone https://github.com/MaLinYu/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
+git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
 ```
 
-也可以直接从 [GitHub Releases](https://github.com/MaLinYu/codex-supervisor/releases) 下载对应版本的源码压缩包，解压到上述 `codex-supervisor` 插件目录中。
+也可以直接从 [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases) 下载对应版本的 `codex-supervisor.zip`，解压到上述 `codex-supervisor` 插件目录中。
 
 #### 升级插件
 
@@ -124,8 +124,11 @@ codex-supervisor/
 ├── assets/
 │   ├── logo.svg                        # 插件图标
 │   └── demo.gif                        # 实时监工与双边对话演示动图
-├── sidecars/codex_panel/               # 原生右侧边栏面板（Sidecar UI）
-│   ├── sidecar.json                    # Aux Pane 入口配置
+├── mcp_config.json                     # MCP 服务和侧栏入口
+├── mcp/                                # 侧栏视图和 MCP 通信
+├── lib/                                # 配置、项目同步、用量和更新
+├── sidecars/codex_panel/               # 后台项目监听与共用聊天组件
+│   ├── sidecar.json                    # 后台 Sidecar 配置
 │   ├── main.mjs                        # 只读本地后端（解析日志 + 叠加实时状态 + ETag）
 │   ├── index.html                      # 面板结构
 │   ├── styles.css                      # 跟随宿主亮/暗主题样式
@@ -173,7 +176,7 @@ codex-supervisor/
    - 通过 `resume` / `fork` 接管的桌面端旧会话仍完整支持派单追问、中途 `steer` 插队、`interrupt` 喊停、审批与提问接管以及侧边栏实时展示。
 
 4. **安装或更新插件后侧边栏空白 / 入口未出现 / Hook 未生效**
-   - Sidecar 后端进程、前端缓存与根目录 `hooks.json` 均在客户端启动时初始化（部分 Antigravity 版本热重载插件时不会重新注册 Hook 或重启 Sidecar）；首次安装或升级后，请**重启一次 Antigravity 客户端**。
+   - MCP 面板、后台 Sidecar 与根目录 `hooks.json` 均在客户端启动时初始化（部分 Antigravity 版本热重载插件时不会重新注册 Hook 或重启 Sidecar）；首次安装或升级后，请**重启一次 Antigravity 客户端**。
    - 若升级前已有旧版 `bridge-daemon.mjs` 在运行，旧实例仍兼容现有 `wait` 流程；待当前任务结束后执行 `codex-ctl.mjs stop` 即可平滑切换到支持 Hook 与 `inbox` 的新版守护进程。
 
 5. **常驻桥接进程与写锁释放**
@@ -194,7 +197,7 @@ codex-supervisor/
 
 ### Highlights
 
-- **Native Side-Pane Chat Viewer (`sidecars/codex_panel`)**: Live left (Codex) / right (Antigravity) conversation stream with a 3-tier detail switcher (`Minimal` / `Default` / `Detailed`), workspace & model badges, per-bubble `model · effort` indicators, collapsible command/diff/tool outputs, Antigravity light/dark theme sync, and ETag polling at **zero LLM token cost**.
+- **MCP Apps Side-Pane Chat Viewer**: Live left (Codex) / right (Antigravity) conversation stream with a 3-tier detail switcher (`Minimal` / `Default` / `Detailed`), workspace & model badges, per-bubble `model · effort` indicators, collapsible command/diff/tool outputs, Antigravity light/dark theme sync, and ETag polling at **zero LLM token cost**.
 - **Zero-Polling Reactive Supervision + Activity-Aware Stall Watchdog + Hook Notifications**: A local `127.0.0.1` bridge daemon (`bridge-daemon.mjs`) holds the `codex app-server --stdio` session (verified against `codex-cli 0.169.1`) and wakes background `wait` calls only on milestones, requests, completion, errors, or genuine turn silence (default 10 min stall watchdog + 30 min per-request hard ceiling, eliminating spurious wakeups on healthy long runs; graceful fallback to 600s fixed wait on older daemons). Even when Antigravity is busy without an active `wait`, bundled `hooks.json` (`PreInvocation` and conditional `Stop` on clients emitting `NO_TOOL_CALL` + `continuationActive: false`) injects fixed-template reminders between tool turns — including deduplicated `turn_watchdog` inbox alerts when an owned running turn stalls or hits the 30 min no-contact ceiling — so Antigravity can safely inspect paginated untrusted Codex payloads (≤16 KiB/page, auto-ACK on complete CLI stdout) via `codex-ctl.mjs inbox` and arm `wait` before going idle.
 - **Native Bidirectional `message_supervisor` Tool**: Codex can proactively push non-blocking progress updates (`wait_for_reply: false`) or pause to ask the supervisor for decisions (`wait_for_reply: true`).
 - **Mid-Turn Steering (`turn/steer`), Approvals & Thread Forking**: Inject corrections while Codex is still working, handle command/patch/permission approvals explicitly, and `fork` Codex Desktop threads cleanly without writer-lock conflicts.
@@ -209,19 +212,19 @@ codex-supervisor/
 ### Install & Upgrade
 
 ```bash
-agy plugin install https://github.com/MaLinYu/codex-supervisor
+agy plugin install https://github.com/cxgit12138/codex-supervisor
 ```
 
-Or clone manually into Antigravity's global plugins directory (or download a source archive from [GitHub Releases](https://github.com/MaLinYu/codex-supervisor/releases)):
+Or clone manually into Antigravity's global plugins directory (or download codex-supervisor.zip from [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases)):
 
 ```powershell
 # Windows (PowerShell)
-git clone https://github.com/MaLinYu/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
+git clone https://github.com/cxgit12138/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
 ```
 
 ```bash
 # macOS / Linux
-git clone https://github.com/MaLinYu/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
+git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
 ```
 
 To upgrade, run `git pull` (or check out the latest release tag), stop any older running bridge daemon via `codex-ctl.mjs stop` after active tasks finish, and restart **Antigravity** once so `hooks.json` and the Sidecar reload cleanly.

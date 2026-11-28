@@ -1673,16 +1673,11 @@ function appendThreadLog(st, record) {
   } catch {}
 }
 
-function showDesktopThread(threadId, enabled) {
-  if (!enabled) return;
-  openDesktop(threadId, true);
-  if (process.platform === "win32") {
-    // 旧全局 hook 也按日志修改时间去重，交接期间共用这个标记。
-    const log = fs.statSync(getThreadState(threadId).logPath, { throwIfNoEntry: false });
-    if (log) {
-      try { writeJsonAtomic(path.join(STATE_DIR, "last-opened.json"), { threadId, mtimeMs: log.mtimeMs }); }
-      catch (err) { logDaemon("无法记录桌面跳转：" + err.message); }
-    }
+function savePanelBinding(st, replaceOwner = false) {
+  try {
+    bindThread(STATE_DIR, st.ownerConversationId, st.threadId, replaceOwner);
+  } catch (err) {
+    logDaemon("无法保存会话绑定：" + err.message);
   }
 }
 
@@ -3596,24 +3591,35 @@ async function dispatchSettings(raw, scope, cwd) {
   // An effort chosen for an old model must not follow an explicit model-only switch.
   if (savedEffort && (!raw.model || !savedModel || raw.model === savedModel)) overrides.effort = savedEffort;
   for (const field of ["model", "effort"]) if (raw[field]) overrides[field] = raw[field];
-  let { model, effort } = applyDefaults(overrides, readSettings());
+  const settings = readSettings();
+  let { model, effort } = applyDefaults(overrides, settings);
+  let effortModel = overrides.effort ? savedModel : settings.model;
   if (!model || !effort) {
     const { config } = await rpcCall("config/read", { cwd: raw.cwd || cwd });
     model ||= config.model;
-    effort ||= config.model_reasoning_effort;
-    if (!model || !effort) {
-      let cursor;
-      do {
-        const page = await rpcCall("model/list", { limit: 100, cursor });
-        const entry = (page.data || page.models).find(m => model ? m.id === model || m.model === model : m.isDefault);
-        if (entry) {
-          model ||= entry.model || entry.id;
-          effort ||= entry.defaultReasoningEffort;
-          break;
-        }
-        cursor = page.nextCursor;
-      } while (cursor);
+    if (!effort) {
+      effort = config.model_reasoning_effort;
+      effortModel = config.model;
     }
+  }
+  const inheritedFromOtherModel = !raw.effort && effortModel && effortModel !== model;
+  if (!model || !effort || inheritedFromOtherModel) {
+    let cursor;
+    do {
+      const page = await rpcCall("model/list", { limit: 100, cursor });
+      const entry = (page.data || page.models).find(m => model ? m.id === model || m.model === model : m.isDefault);
+      if (entry) {
+        model ||= entry.model || entry.id;
+        const supported = entry.supportedReasoningEfforts;
+        if (inheritedFromOtherModel && supported?.length && !supported.some(option => option.reasoningEffort === effort)) {
+          delete overrides.effort;
+          effort = undefined;
+        }
+        effort ||= entry.defaultReasoningEffort;
+        break;
+      }
+      cursor = page.nextCursor;
+    } while (cursor);
   }
   return { ...raw, model, effort, overrides, pending: Boolean(pending || raw.model || raw.effort) };
 }
@@ -4206,10 +4212,10 @@ async function handleApi(req, res) {
 
   lastActivityMs = Date.now();
   const dispatch = ["/start", "/resume", "/fork", "/send", "/steer", "/session-settings", "/sync-projects"].includes(url.pathname);
-  if (dispatch && activeInstallers().length) return jsonResponse(res, 409, { error: "插件正在更新" });
   if (dispatch) dispatches++;
 
   try {
+    if (dispatch && activeInstallers().length) return jsonResponse(res, 409, { error: "插件正在更新" });
     if (url.pathname === "/update-idle" && req.method === "POST") {
       const busy = dispatches || pendingServerRequests.size || [...threads.values()].some(st =>
         st.activeTurnId || st.hasUnobservedActiveTurn || st.status === "running" || st.status === "waiting_input" || st.waiters.size ||
@@ -4311,7 +4317,10 @@ async function handleApi(req, res) {
         if (body.ephemeral !== undefined) startParams.ephemeral = Boolean(body.ephemeral);
         if (body.baseInstructions) startParams.baseInstructions = body.baseInstructions;
 
-        const projectId = await syncProjects(body.projectId, body.cwd);
+        const projectId = await syncProjects(body.projectId, body.cwd).catch(err => {
+          logDaemon("无法关联 Codex 项目：" + err.message);
+          return null;
+        });
         if (projectId) startParams.projectId = projectId;
         const thRes = await rpcCall("thread/start", startParams);
         const threadId = thRes.thread?.id || thRes.threadId || thRes.id;
@@ -4378,6 +4387,7 @@ async function handleApi(req, res) {
             });
           }
 
+          savePanelBinding(st);
           return {
             instanceId: INSTANCE_ID,
             threadId,
@@ -4387,14 +4397,12 @@ async function handleApi(req, res) {
             logPath: st.logPath,
           };
         });
-        if (body.prompt) {
-          try {
-            bindThread(STATE_DIR, body.ownerConversationId, threadId);
-            if (scope) writeSessionSettings(STATE_DIR, scope, raw.sessionKey ? { bound: threadId } : {});
-          }
-          catch (err) { result.panelWarning = "任务已派发，会话绑定保存失败：" + err.message; }
-          showDesktopThread(threadId, settings.openDesktop);
+        try {
+          if (scope) writeSessionSettings(STATE_DIR, scope, raw.sessionKey ? { bound: threadId } : {});
+        } catch (err) {
+          result.panelWarning = "任务已派发，首单设置清理失败：" + err.message;
         }
+        if (body.prompt) openDesktop(threadId, settings.openDesktop);
         return jsonResponse(res, 200, result);
       });
     }
@@ -4463,6 +4471,7 @@ async function handleApi(req, res) {
 
         // Synchronous ownership claim/transfer critical section (NO await between checks and commit)
         pruneExpiredBatchesAndNotifications();
+        const previousOwner = st.ownerConversationId;
         if (reqConvId) {
           if (!st.ownerConversationId) {
             if (
@@ -4524,6 +4533,8 @@ async function handleApi(req, res) {
           err.statusCode = 400;
           throw err;
         }
+
+        if (reqConvId && st.ownerConversationId === reqConvId) savePanelBinding(st, previousOwner !== st.ownerConversationId);
 
         appendThreadLog(st, {
           kind: "thread_meta",
@@ -4686,6 +4697,7 @@ async function handleApi(req, res) {
           }
         }
 
+        savePanelBinding(st);
         return {
           instanceId: INSTANCE_ID,
           sourceThreadId: body.threadId,
@@ -4726,6 +4738,9 @@ async function handleApi(req, res) {
         const turnId = tRes.turn?.id || tRes.turnId || null;
         const commitInfo = finalizeTurnStart(st, turnId, turnCtx);
         saveAdmittedSelection(st, body, turnParams, commitInfo);
+        if (commitInfo.committed && st.ownerConversationId && st.ownerConversationId === normalizeConversationId(body.ownerConversationId)) {
+          savePanelBinding(st);
+        }
         if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
         appendThreadLog(st, {
           kind: "supervisor_prompt",
@@ -4747,7 +4762,7 @@ async function handleApi(req, res) {
           status: st.status,
         };
       });
-      showDesktopThread(out.threadId, shouldOpen);
+      openDesktop(out.threadId, shouldOpen);
       return jsonResponse(res, 200, out);
     }
 
@@ -4865,7 +4880,7 @@ async function handleApi(req, res) {
           throw err;
         }
       });
-      showDesktopThread(out.threadId, shouldOpen);
+      openDesktop(out.threadId, shouldOpen);
       return jsonResponse(res, 200, out);
     }
 
