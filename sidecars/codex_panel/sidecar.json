@@ -3,19 +3,9 @@
   "args": ["main.mjs"],
   "restart_policy": "always",
   "display_name": "Codex Supervisor",
-  "description": "Live two-way chat view of Antigravity supervising local OpenAI Codex sessions, with session switching and collapsible tool details.",
-  "has_web_ui": true,
+  "description": "监听新建的本地项目并同步到 Codex。",
+  "has_web_ui": false,
   "agent_permissions": {
     "allows_user_interactions": false
-  },
-  "ui_config": {
-    "display_name": "Codex Supervisor",
-    "views": [
-      {
-        "path": "/",
-        "entrypoint": "SIDECAR_UI_ENTRYPOINT_AUX_PANE",
-        "title": "Codex Supervisor"
-      }
-    ]
   }
 }

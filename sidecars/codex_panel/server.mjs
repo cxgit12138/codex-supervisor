@@ -25,10 +25,14 @@ function watchProjects() {
     }).on("error", err => console.error("项目目录监听中断", err.message));
   }
   check();
-  setInterval(check, 30000).unref();
+  setInterval(check, 30000);
 }
 
 export async function serve(readPanelState) {
+  // Windows 会锁住当前工作目录。安装目录必须能在更新时改名。
+  process.chdir(os.homedir());
+  watchProjects();
+  if (!process.env.ANTIGRAVITY_SIDECAR_WEB_PORT) return;
   const fallback = path.join(os.homedir(), ".gemini/antigravity/lib/node_modules/sidecar_sdk/index.mjs");
   const sdk = await import("sidecar_sdk").catch(error => {
     if (error.code !== "ERR_MODULE_NOT_FOUND") throw error;
@@ -55,8 +59,5 @@ export async function serve(readPanelState) {
   for (const [old, name] of Object.entries({ "save-settings": "save_settings", "update-check": "check_update", "update-install": "install_update" })) {
     app.api("/api/" + old, actions[name][1]);
   }
-  // Windows 会锁住当前工作目录。安装目录必须能在更新时改名。
-  process.chdir(os.homedir());
   await app.run();
-  watchProjects();
 }
