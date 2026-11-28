@@ -10,15 +10,15 @@
 #thread { display:flex; flex-direction:column; height:100%; min-height:0; gap:8px; position:relative; }
 #chat-scroll { min-height:0; }
 #back { width:auto; }
-header, .brand, .bridge, nav, footer, .steps, .actions, #recent button { display:flex; align-items:center; gap:7px; }
+header, .brand, .bridge, nav, footer, .actions, #recent button { display:flex; align-items:center; gap:7px; }
 header { border-bottom:1px solid var(--cs-border); padding-bottom:9px; flex-wrap:wrap; }
 nav { margin-left:auto; gap:2px; }
 svg { width:16px; height:16px; fill:none; stroke:currentColor; stroke-width:1.7; stroke-linecap:round; stroke-linejoin:round; flex-shrink:0; }
 .symbols { position:absolute; width:0; height:0; }
-.brand > svg,.terminal { color:var(--cs-primary); }
+.brand > svg { color:var(--cs-primary); }
 .brand { font-size:13px; }
-.bridge, footer, h3, .steps, #selectors label, small { color:var(--cs-fg-muted); font-size:11px; }
-.bridge,.steps span { border:1px solid var(--cs-border); padding:2px 6px; border-radius:6px; }
+.bridge, footer, h3, #selectors label, small { color:var(--cs-fg-muted); font-size:11px; }
+.bridge { border:1px solid var(--cs-border); padding:2px 6px; border-radius:6px; }
 .bridge { border-radius:16px; }
 i { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--cs-fg-muted); flex:none; }
 i.online,i.running { background:#46bf83; }
@@ -29,10 +29,7 @@ button, select { color:var(--cs-fg); background:var(--cs-bg); border:1px solid v
 button:hover { background:var(--cs-muted); } button:disabled {opacity:.6; cursor:default;}
 nav button { display:grid; place-items:center; width:28px; height:28px; padding:0; border-color:transparent; }
 main { padding:10px 0; } h2 { font-size:14px; } h3 { margin:10px 0 5px; font-weight:500; }
-.hero,#selectors label,#recent:not(:empty),dialog { background:var(--cs-surface); border:1px solid var(--cs-border); border-radius:10px; }
-.hero { padding:14px 10px; text-align:center; } .terminal { width:38px; height:38px; padding:7px; border:1px solid var(--cs-border); border-radius:9px; }
-.hero h2 {margin:5px 0;} .hero p {color:var(--cs-fg-muted); max-width:300px; margin:0 auto 10px; font-size:12px;}
-.steps {justify-content:center; flex-wrap:wrap; gap:4px;} .steps svg {width:10px;}
+#selectors label,#recent:not(:empty),dialog { background:var(--cs-surface); border:1px solid var(--cs-border); border-radius:10px; }
 #selectors { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin:10px 0; }
 #selectors label { padding:8px; } select { display:block; margin-top:4px; width:100%; font-size:12px; }
 #recent {overflow:hidden;} #recent button {width:100%; border:0; border-radius:0; padding:8px; background:transparent; text-align:left;} #recent button:hover {background:var(--cs-muted);}
@@ -46,8 +43,19 @@ dl {display:grid;grid-template-columns:auto 1fr;gap:7px;} dt {color:var(--cs-fg-
 @media(prefers-reduced-motion:reduce){.online {animation:none;}}
 
 @media (min-width:680px) {
-  #standby { display:grid; grid-template-columns: minmax(0,1fr) minmax(0,1fr); gap:12px; align-items:start; }
-  .hero { grid-column:1/-1; }
-  #home-config #selectors, #history h3 { margin-top:0; }
+  #standby { display:grid; grid-template-columns: minmax(0,5fr) minmax(0,7fr); gap:12px; align-items:start; }
+
+  #home-config h3,.home-right > section:first-child h3 {margin-top:0;}
 }
 #heatmap { grid-auto-columns:minmax(10px,1fr); }
+
+#standby h3 {display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--cs-fg);}
+.scope-badge {font-size:10px;font-weight:500;padding:1px 6px;border-radius:5px;color:var(--cs-primary);background:color-mix(in srgb,var(--cs-primary) 10%,var(--cs-surface));}
+#session-config {position:relative;overflow:hidden;background:var(--cs-surface);border:1px solid var(--cs-border);border-radius:8px;padding:10px;display:grid;gap:10px;}
+#session-config label,#current-meta,.enter {font-size:11px;color:var(--cs-fg-muted);}
+#session-config small {border-top:1px solid var(--cs-border);padding-top:6px;}
+#current-card {width:100%;display:flex;align-items:center;gap:8px;text-align:left;padding:10px;background:color-mix(in srgb,var(--primary,var(--cs-primary)) 8%,var(--cs-surface));border:1px solid color-mix(in srgb,var(--cs-primary) 34%,var(--cs-border));border-left:3px solid var(--cs-primary);}
+#current-card:hover {background:color-mix(in srgb,var(--cs-primary) 13%,var(--cs-surface));}
+.current-body {display:grid;gap:3px;min-width:0;} .current-body>* {overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.enter {margin-left:auto;white-space:nowrap;color:var(--cs-primary);}
+#unbound {padding:10px;margin:0;font-size:12px;color:var(--cs-fg-muted);border:1px dashed var(--cs-border);border-radius:7px;}

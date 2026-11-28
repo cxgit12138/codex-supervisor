@@ -60,14 +60,14 @@
 
 [hidden] { display:none !important; }
 #model-feedback { position: relative; overflow: hidden; border-radius: 7px; }
-#model-feedback.beam::after {
+:is(#model-feedback,#session-config).beam::after {
   content: ""; position: absolute; inset: 0; pointer-events: none;
   background: linear-gradient(105deg, transparent 32%, #74c6ff99, transparent 68%);
   animation: model-beam 480ms ease-out both;
 }
 @keyframes model-beam { from { transform: translateX(-105%); } to { transform: translateX(105%); } }
 @media (prefers-reduced-motion: reduce) {
-  #model-feedback.beam::after { animation: none; background: transparent; border: 2px solid var(--cs-primary); border-radius: inherit; }
+  :is(#model-feedback,#session-config).beam::after { animation: none; background: transparent; border: 2px solid var(--cs-primary); border-radius: inherit; }
 }
 #usage-periods { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 8px; }
 #usage-periods article { padding: 10px; border: 1px solid var(--cs-border); border-radius: 8px; background: var(--cs-surface); }

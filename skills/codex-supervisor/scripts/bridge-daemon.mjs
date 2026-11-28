@@ -9,7 +9,7 @@
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
-import { readSettings, applyDefaults, openDesktop, bindThread, configRoot, activeInstallers } from "../../../lib/preferences.mjs";
+import { readSettings, applyDefaults, sessionSettings, writeSessionSettings, boundThread, openDesktop, bindThread, configRoot, activeInstallers } from "../../../lib/preferences.mjs";
 import { projectSync } from "../../../lib/projects.mjs";
 import path from "node:path";
 import os from "node:os";
@@ -1032,6 +1032,8 @@ function getThreadState(threadId) {
       name: null,
       cwd: null,
       model: null,
+      effort: null,
+      settingsRevision: 0,
       sandbox: null,
       approvalPolicy: null,
       status: "idle", // idle | running | waiting_input | error
@@ -1478,6 +1480,7 @@ function buildCompactSummary(st) {
     name: st.name,
     cwd: st.cwd,
     model: st.model,
+    effort: st.effort,
     sandbox: st.sandbox,
     approvalPolicy: st.approvalPolicy,
     status: st.status,
@@ -1571,6 +1574,24 @@ function handleServerNotification(msg) {
   const method = msg.method;
   const p = msg.params || {};
   const threadId = p.threadId || p.thread?.id;
+
+  if (method === "thread/settings/updated" && threadId) {
+    const st = threads.get(threadId);
+    if (st) {
+      st.model = p.threadSettings.model;
+      st.effort = p.threadSettings.effort;
+      st.settingsRevision++;
+      appendThreadLog(st, { kind: "session_selection", model: st.model, effort: st.effort });
+    }
+    return;
+  }
+  if (method === "model/rerouted" && threadId) {
+    const st = getThreadState(threadId);
+    st.model = p.toModel;
+    st.reroutedTurn = p.turnId;
+    appendThreadLog(st, { kind: "model_rerouted", model: p.toModel, turnId: p.turnId });
+    return;
+  }
 
   if (method === "serverRequest/resolved") {
     const reqRpcId = p.requestId;
@@ -2324,6 +2345,54 @@ function validateMode(mode) {
   return mode;
 }
 
+function lockFirstDispatch(scope, run) {
+  // 同一未派单对话的保存和首次绑定按顺序执行。
+  const key = scope?.sessionKey || scope?.conversationId;
+  return key ? withThreadLock("session-settings:" + key, run) : run();
+}
+
+async function dispatchSettings(raw, scope, cwd) {
+  const overrides = scope ? { ...sessionSettings(STATE_DIR, scope) } : {};
+  delete overrides.pending;
+  delete overrides.bound;
+  for (const field of ["model", "effort"]) if (raw[field]) overrides[field] = raw[field];
+  let { model, effort } = applyDefaults(overrides, readSettings());
+  if (!model || !effort) {
+    const { config } = await rpcCall("config/read", { cwd: raw.cwd || cwd });
+    model ||= config.model;
+    effort ||= config.model_reasoning_effort;
+    if (!model || !effort) {
+      let cursor;
+      do {
+        const page = await rpcCall("model/list", { limit: 100, cursor });
+        const entry = (page.data || page.models).find(m => model ? m.id === model || m.model === model : m.isDefault);
+        if (entry) {
+          model ||= entry.model || entry.id;
+          effort ||= entry.defaultReasoningEffort;
+          break;
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
+  }
+  return { ...raw, model, effort, overrides };
+}
+
+async function startSelectedTurn(st, body, params) {
+  const revision = st.settingsRevision;
+  const result = await rpcCall("turn/start", params);
+  const turnId = result.turn?.id || result.turnId || null;
+  // 同一次请求期间收到的实际配置或改派通知优先于请求参数。
+  if (revision === st.settingsRevision) {
+    if (!turnId || st.reroutedTurn !== turnId) st.model = body.model || st.model;
+    st.effort = body.effort ?? st.effort;
+  }
+  if (params.cwd) st.cwd = params.cwd;
+  markTurnStartedIfNotFinished(st, turnId);
+  writeSessionSettings(STATE_DIR, { threadId: st.threadId }, body.overrides);
+  return turnId;
+}
+
 function applyCollaborationMode(turnParams, body, st) {
   const mode = validateMode(body.mode);
   if (!mode) return null;
@@ -2837,7 +2906,7 @@ async function handleApi(req, res) {
   }
 
   lastActivityMs = Date.now();
-  const dispatch = ["/start", "/resume", "/fork", "/send", "/steer", "/sync-projects"].includes(url.pathname);
+  const dispatch = ["/start", "/resume", "/fork", "/send", "/steer", "/session-settings", "/sync-projects"].includes(url.pathname);
   if (dispatch && activeInstallers().length) return jsonResponse(res, 409, { error: "插件正在更新" });
   if (dispatch) dispatches++;
 
@@ -2862,6 +2931,27 @@ async function handleApi(req, res) {
       const body = await readJsonBody(req);
       return jsonResponse(res, 200, handleInboxAck(body));
     }
+    if (url.pathname === "/session-settings" && req.method === "POST") {
+      const data = await readJsonBody(req);
+      return await lockFirstDispatch(data, async () => {
+        const bound = data.conversationId ? boundThread(STATE_DIR, data.conversationId) : data.sessionKey && sessionSettings(STATE_DIR, { sessionKey: data.sessionKey }).bound;
+        if ((data.conversationId || bound) && data.threadId && bound !== data.threadId) return jsonResponse(res, 409, { error: "对话绑定已改变，请刷新后再修改" });
+        const scope = { ...data, threadId: bound || data.threadId };
+        const save = () => {
+          const prefs = sessionSettings(STATE_DIR, scope);
+          for (const key of ["model", "effort"]) {
+            if (data[key] === undefined) continue;
+            if (typeof data[key] !== "string") throw new Error("会话设置格式无效");
+            if (data[key]) prefs[key] = data[key];
+            else delete prefs[key];
+          }
+          prefs.pending = true;
+          writeSessionSettings(STATE_DIR, scope, prefs);
+          return prefs;
+        };
+        return jsonResponse(res, 200, scope.threadId ? await withThreadLock(scope.threadId, save) : save());
+      });
+    }
     if (url.pathname === "/models" && req.method === "GET") {
       const limit = Number(url.searchParams.get("limit") || 30);
       const all = url.searchParams.has("settings");
@@ -2879,8 +2969,8 @@ async function handleApi(req, res) {
         isDefault: Boolean(m.isDefault),
         supportedReasoningEfforts: (m.supportedReasoningEfforts || []).map(level => level.reasoningEffort),
       }));
-      const configuredModel = all ? (await rpcCall("config/read", {})).config?.model : undefined;
-      return jsonResponse(res, 200, { models: items, configuredModel });
+      const config = all ? (await rpcCall("config/read", {})).config : {};
+      return jsonResponse(res, 200, { models: items, configuredModel: config.model, configuredEffort: config.model_reasoning_effort });
     }
 
     if (url.pathname === "/threads" && req.method === "GET") {
@@ -2901,110 +2991,122 @@ async function handleApi(req, res) {
 
     if (url.pathname === "/start" && req.method === "POST") {
       const settings = readSettings();
-      const body = applyDefaults(await readJsonBody(req), settings);
-      const reqMode = validateMode(body.mode);
-      const startParams = {
-        dynamicTools: [SUPERVISOR_DYNAMIC_TOOL],
-        developerInstructions: body.developerInstructions
-          ? `${SUPERVISOR_DEV_INSTRUCTIONS}\n\n${body.developerInstructions}`
-          : SUPERVISOR_DEV_INSTRUCTIONS,
-      };
-      if (body.cwd) startParams.cwd = body.cwd;
-      if (body.model) startParams.model = body.model;
-      if (body.effort) startParams.config = { model_reasoning_effort: body.effort };
-      if (body.sandbox) startParams.sandbox = body.sandbox;
-      if (body.approvalPolicy) startParams.approvalPolicy = body.approvalPolicy;
-      if (body.ephemeral !== undefined) startParams.ephemeral = Boolean(body.ephemeral);
-      if (body.baseInstructions) startParams.baseInstructions = body.baseInstructions;
-
-      const projectId = await syncProjects(body.projectId, body.cwd);
-      if (projectId) startParams.projectId = projectId;
-      const thRes = await rpcCall("thread/start", startParams);
-      const threadId = thRes.thread?.id || thRes.threadId || thRes.id;
-
-      const result = await withThreadLock(threadId, async () => {
-        const st = getThreadState(threadId);
-        // Bind notification routing synchronously BEFORE turn/start RPC
-        bindNewThreadOwner(st, body.ownerConversationId);
-        st.cwd = thRes.cwd || thRes.thread?.cwd || body.cwd || null;
-        st.model = thRes.model || body.model || null;
-        st.sandbox = normalizeSandboxPolicy(thRes.sandbox) || body.sandbox || null;
-        st.approvalPolicy = normalizeApprovalPolicy(thRes.approvalPolicy) || body.approvalPolicy || null;
-
-        if (body.name) {
-          st.name = body.name;
-          try {
-            await rpcCall("thread/name/set", { threadId, name: body.name });
-          } catch {}
-        }
-
-        appendThreadLog(st, {
-          kind: "thread_meta",
-          action: "start",
-          name: st.name,
-          cwd: st.cwd,
-          model: st.model,
-          sandbox: st.sandbox,
-          approvalPolicy: st.approvalPolicy,
-        });
-
-        const cursorBefore = st.nextSeq - 1;
-        let turnId = null;
-        if (body.prompt) {
-          const turnParams = {
-            threadId,
-            input: makeTextInput(body.prompt),
-          };
-          if (body.model) turnParams.model = body.model;
-          if (body.effort) turnParams.effort = body.effort;
-          if (body.cwd) turnParams.cwd = body.cwd;
-          if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
-          applyCollaborationMode(turnParams, body, st);
-          const tRes = await rpcCall("turn/start", turnParams);
-          turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId);
-          if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
-          appendThreadLog(st, {
-            kind: "supervisor_prompt",
-            action: "start",
-            turnId,
-            model: body.model || st.model,
-            effort: body.effort || null,
-            mode: reqMode,
-            prompt: body.prompt,
-          });
-        }
-
-        return {
-          instanceId: INSTANCE_ID,
-          threadId,
-          turnId,
-          cursor: formatCursor(cursorBefore),
-          status: st.status,
-          logPath: st.logPath,
+      const raw = await readJsonBody(req);
+      const scope = raw.sessionKey ? { sessionKey: raw.sessionKey } : raw.ownerConversationId ? { conversationId: raw.ownerConversationId } : null;
+      return await lockFirstDispatch(scope, async () => {
+        const previous = raw.sessionKey && sessionSettings(STATE_DIR, scope).bound;
+        if (previous) return jsonResponse(res, 409, { error: "这份首单设置已绑定会话，请用 send 续聊", threadId: previous });
+        const body = await dispatchSettings(raw, scope);
+        const reqMode = validateMode(body.mode);
+        const startParams = {
+          dynamicTools: [SUPERVISOR_DYNAMIC_TOOL],
+          developerInstructions: body.developerInstructions
+            ? `${SUPERVISOR_DEV_INSTRUCTIONS}\n\n${body.developerInstructions}`
+            : SUPERVISOR_DEV_INSTRUCTIONS,
         };
+        if (body.cwd) startParams.cwd = body.cwd;
+        if (body.model) startParams.model = body.model;
+        if (body.effort) startParams.config = { model_reasoning_effort: body.effort };
+        if (body.sandbox) startParams.sandbox = body.sandbox;
+        if (body.approvalPolicy) startParams.approvalPolicy = body.approvalPolicy;
+        if (body.ephemeral !== undefined) startParams.ephemeral = Boolean(body.ephemeral);
+        if (body.baseInstructions) startParams.baseInstructions = body.baseInstructions;
+
+        const projectId = await syncProjects(body.projectId, body.cwd);
+        if (projectId) startParams.projectId = projectId;
+        const thRes = await rpcCall("thread/start", startParams);
+        const threadId = thRes.thread?.id || thRes.threadId || thRes.id;
+
+        const result = await withThreadLock(threadId, async () => {
+          const st = getThreadState(threadId);
+          // Bind notification routing synchronously BEFORE turn/start RPC
+          bindNewThreadOwner(st, body.ownerConversationId);
+          st.cwd = thRes.cwd || thRes.thread?.cwd || body.cwd || null;
+          st.model = thRes.model || body.model || null;
+          st.effort = thRes.reasoningEffort ?? body.effort ?? null;
+          st.sandbox = normalizeSandboxPolicy(thRes.sandbox) || body.sandbox || null;
+          st.approvalPolicy = normalizeApprovalPolicy(thRes.approvalPolicy) || body.approvalPolicy || null;
+
+          if (body.name) {
+            st.name = body.name;
+            try {
+              await rpcCall("thread/name/set", { threadId, name: body.name });
+            } catch {}
+          }
+
+          appendThreadLog(st, {
+            kind: "thread_meta",
+            action: "start",
+            name: st.name,
+            cwd: st.cwd,
+            model: st.model,
+            effort: st.effort,
+            sandbox: st.sandbox,
+            approvalPolicy: st.approvalPolicy,
+          });
+
+          if (!body.prompt) writeSessionSettings(STATE_DIR, { threadId: st.threadId }, body.overrides);
+          const cursorBefore = st.nextSeq - 1;
+          let turnId = null;
+          if (body.prompt) {
+            const turnParams = {
+              threadId,
+              input: makeTextInput(body.prompt),
+            };
+            if (body.model) turnParams.model = body.model;
+            if (body.effort) turnParams.effort = body.effort;
+            if (body.cwd) turnParams.cwd = body.cwd;
+            if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
+            applyCollaborationMode(turnParams, body, st);
+            turnId = await startSelectedTurn(st, body, turnParams);
+            if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
+            appendThreadLog(st, {
+              kind: "supervisor_prompt",
+              action: "start",
+              turnId,
+              model: st.model,
+              effort: st.effort,
+              mode: reqMode,
+              prompt: body.prompt,
+            });
+          }
+
+          return {
+            instanceId: INSTANCE_ID,
+            threadId,
+            turnId,
+            cursor: formatCursor(cursorBefore),
+            status: st.status,
+            logPath: st.logPath,
+          };
+        });
+        if (body.prompt) {
+          try {
+            bindThread(STATE_DIR, body.ownerConversationId, threadId);
+            if (scope) writeSessionSettings(STATE_DIR, scope, raw.sessionKey ? { bound: threadId } : {});
+          }
+          catch (err) { result.panelWarning = "任务已派发，会话绑定保存失败：" + err.message; }
+          showDesktopThread(threadId, settings.openDesktop);
+        }
+        return jsonResponse(res, 200, result);
       });
-      if (body.prompt) {
-        try { bindThread(STATE_DIR, body.ownerConversationId, threadId); }
-        catch (err) { result.panelWarning = "任务已派发，会话绑定保存失败：" + err.message; }
-        showDesktopThread(threadId, settings.openDesktop);
-      }
-      return jsonResponse(res, 200, result);
     }
 
     if (url.pathname === "/resume" && req.method === "POST") {
-      const body = await readJsonBody(req);
-      if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
-      if (body.claimOwner && body.prompt) {
+      const raw = await readJsonBody(req);
+      if (!raw.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      if (raw.claimOwner && raw.prompt) {
         return jsonResponse(res, 400, { error: "resume --claim cannot be combined with --prompt; claim first, then call send" });
       }
-      const reqMode = validateMode(body.mode);
-      const reqConvId = normalizeConversationId(body.ownerConversationId);
+      const reqMode = validateMode(raw.mode);
+      const reqConvId = normalizeConversationId(raw.ownerConversationId);
 
-      const out = await withThreadLock(body.threadId, async () => {
+      const out = await withThreadLock(raw.threadId, async () => {
+        const body = await dispatchSettings(raw, { threadId: raw.threadId }, getThreadState(raw.threadId).cwd);
         const params = { threadId: body.threadId, excludeTurns: true };
         if (body.cwd) params.cwd = body.cwd;
         if (body.model) params.model = body.model;
+        if (body.effort) params.config = { model_reasoning_effort: body.effort };
         if (body.sandbox) params.sandbox = body.sandbox;
         if (body.approvalPolicy) params.approvalPolicy = body.approvalPolicy;
 
@@ -3027,7 +3129,8 @@ async function handleApi(req, res) {
 
         const st = getThreadState(body.threadId);
         st.cwd = effCwd || st.cwd;
-        st.model = resData.model || st.model;
+        st.model = resData.model || body.model || st.model;
+        st.effort = resData.reasoningEffort ?? body.effort ?? st.effort;
         st.sandbox = effSandbox || st.sandbox;
         st.approvalPolicy = effApproval || st.approvalPolicy;
         st.name = resData.thread?.name || st.name;
@@ -3106,10 +3209,12 @@ async function handleApi(req, res) {
           name: st.name,
           cwd: st.cwd,
           model: st.model,
+          effort: st.effort,
           sandbox: st.sandbox,
           approvalPolicy: st.approvalPolicy,
         });
 
+        if (!body.prompt) writeSessionSettings(STATE_DIR, { threadId: st.threadId }, body.overrides);
         const cursorBefore = st.nextSeq - 1;
         let turnId = null;
         if (body.prompt) {
@@ -3117,16 +3222,14 @@ async function handleApi(req, res) {
           if (body.model) turnParams.model = body.model;
           if (body.effort) turnParams.effort = body.effort;
           applyCollaborationMode(turnParams, body, st);
-          const tRes = await rpcCall("turn/start", turnParams);
-          turnId = tRes.turn?.id || tRes.turnId || null;
-          markTurnStartedIfNotFinished(st, turnId);
+          turnId = await startSelectedTurn(st, body, turnParams);
           if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
           appendThreadLog(st, {
             kind: "supervisor_prompt",
             action: "resume",
             turnId,
-            model: body.model || st.model,
-            effort: body.effort || null,
+            model: st.model,
+            effort: st.effort,
             mode: reqMode,
             prompt: body.prompt,
           });
@@ -3139,7 +3242,7 @@ async function handleApi(req, res) {
           cursor: formatCursor(cursorBefore),
           status: st.status,
           ownerConversationId: st.ownerConversationId,
-          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model },
+          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model, effort: st.effort },
           logPath: st.logPath,
         };
       });
@@ -3147,13 +3250,15 @@ async function handleApi(req, res) {
     }
 
     if (url.pathname === "/fork" && req.method === "POST") {
-      const body = await readJsonBody(req);
-      if (!body.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      const raw = await readJsonBody(req);
+      if (!raw.threadId) return jsonResponse(res, 400, { error: "threadId required" });
+      const body = await dispatchSettings(raw, { threadId: raw.threadId }, getThreadState(raw.threadId).cwd);
       const reqMode = validateMode(body.mode);
 
       const params = { threadId: body.threadId, excludeTurns: true };
       if (body.cwd) params.cwd = body.cwd;
       if (body.model) params.model = body.model;
+      if (body.effort) params.config = { model_reasoning_effort: body.effort };
       if (body.sandbox) params.sandbox = body.sandbox;
       if (body.approvalPolicy) params.approvalPolicy = body.approvalPolicy;
       if (body.ephemeral !== undefined) params.ephemeral = Boolean(body.ephemeral);
@@ -3186,7 +3291,8 @@ async function handleApi(req, res) {
         // Bind routing ONLY on the new forked thread (source thread stays untouched)
         bindNewThreadOwner(st, body.ownerConversationId);
         st.cwd = effCwd || st.cwd;
-        st.model = resData.model || st.model;
+        st.model = resData.model || body.model || st.model;
+        st.effort = resData.reasoningEffort ?? body.effort ?? st.effort;
         st.sandbox = effSandbox || st.sandbox;
         st.approvalPolicy = effApproval || st.approvalPolicy;
         st.name = body.name || resData.thread?.name || st.name;
@@ -3204,10 +3310,12 @@ async function handleApi(req, res) {
           name: st.name,
           cwd: st.cwd,
           model: st.model,
+          effort: st.effort,
           sandbox: st.sandbox,
           approvalPolicy: st.approvalPolicy,
         });
 
+        if (!body.prompt) writeSessionSettings(STATE_DIR, { threadId: st.threadId }, body.overrides);
         const cursorBefore = st.nextSeq - 1;
         let turnId = null;
         if (body.prompt) {
@@ -3216,16 +3324,14 @@ async function handleApi(req, res) {
           if (body.effort) turnParams.effort = body.effort;
           try {
             applyCollaborationMode(turnParams, body, st);
-            const tRes = await rpcCall("turn/start", turnParams);
-            turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
+            turnId = await startSelectedTurn(st, body, turnParams);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fork",
               turnId,
-              model: body.model || st.model,
-              effort: body.effort || null,
+              model: st.model,
+              effort: st.effort,
               mode: reqMode,
               prompt: body.prompt,
             });
@@ -3242,7 +3348,7 @@ async function handleApi(req, res) {
           turnId,
           cursor: formatCursor(cursorBefore),
           status: st.status,
-          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model },
+          effective: { cwd: st.cwd, sandbox: st.sandbox, approvalPolicy: st.approvalPolicy, model: st.model, effort: st.effort },
           logPath: st.logPath,
         };
       });
@@ -3250,13 +3356,14 @@ async function handleApi(req, res) {
     }
 
     if (url.pathname === "/send" && req.method === "POST") {
-      const body = await readJsonBody(req);
+      const raw = await readJsonBody(req);
       const { openDesktop: shouldOpen } = readSettings();
-      if (!body.threadId || !body.prompt) {
+      if (!raw.threadId || !raw.prompt) {
         return jsonResponse(res, 400, { error: "threadId and prompt required" });
       }
-      const reqMode = validateMode(body.mode);
-      const out = await withThreadLock(body.threadId, async () => {
+      const reqMode = validateMode(raw.mode);
+      const out = await withThreadLock(raw.threadId, async () => {
+        const body = await dispatchSettings(raw, { threadId: raw.threadId }, getThreadState(raw.threadId).cwd);
         const st = getThreadState(body.threadId);
         const cursorBefore = st.nextSeq - 1;
         const turnParams = {
@@ -3269,16 +3376,14 @@ async function handleApi(req, res) {
         if (body.approvalPolicy) turnParams.approvalPolicy = body.approvalPolicy;
         applyCollaborationMode(turnParams, body, st);
 
-        const tRes = await rpcCall("turn/start", turnParams);
-        const turnId = tRes.turn?.id || tRes.turnId || null;
-        markTurnStartedIfNotFinished(st, turnId);
+        const turnId = await startSelectedTurn(st, body, turnParams);
         if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
         appendThreadLog(st, {
           kind: "supervisor_prompt",
           action: "send",
           turnId,
-          model: body.model || st.model,
-          effort: body.effort || null,
+          model: st.model,
+          effort: st.effort,
           mode: reqMode,
           prompt: body.prompt,
         });
@@ -3314,19 +3419,19 @@ async function handleApi(req, res) {
         if (!expectedTurnId) {
           if (body.fallbackSend && !explicitTurnId) {
             const cursorBefore = st.nextSeq - 1;
-            const tRes = await rpcCall("turn/start", {
+            const settings = await dispatchSettings(body, { threadId: st.threadId }, st.cwd);
+            const turnId = await startSelectedTurn(st, settings, {
+              model: settings.model, effort: settings.effort,
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
-            const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
               turnId,
               model: st.model,
-              effort: null,
+              effort: st.effort,
               prompt: body.prompt,
             });
             return {
@@ -3362,19 +3467,19 @@ async function handleApi(req, res) {
           // and the RPC error explicitly indicates no active turn (never on timeout or turn mismatch).
           if (body.fallbackSend && !explicitTurnId && !st.activeTurnId && isNoActiveTurnError(err)) {
             const fbCursorBefore = st.nextSeq - 1;
-            const tRes = await rpcCall("turn/start", {
+            const settings = await dispatchSettings(body, { threadId: st.threadId }, st.cwd);
+            const turnId = await startSelectedTurn(st, settings, {
+              model: settings.model, effort: settings.effort,
               threadId: body.threadId,
               input: makeTextInput(body.prompt),
             });
-            const turnId = tRes.turn?.id || tRes.turnId || null;
-            markTurnStartedIfNotFinished(st, turnId);
             if (st.ownerConversationId) refreshConversationFlags(st.ownerConversationId);
             appendThreadLog(st, {
               kind: "supervisor_prompt",
               action: "fallback_send",
               turnId,
               model: st.model,
-              effort: null,
+              effort: st.effort,
               prompt: body.prompt,
             });
             return {

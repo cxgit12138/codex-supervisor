@@ -28,8 +28,9 @@ const ALLOWED_FLAGS = {
   health: new Set([]),
   models: new Set(["limit", "settings"]),
   "sync-projects": new Set([]),
+  "session-settings": new Set(["conversation-id", "thread-id", "session-key", "model", "effort"]),
   threads: new Set(["limit", "cwd"]),
-  start: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
+  start: new Set(["session-key", "cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
   resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "claim", "prompt", "prompt-file", "stdin"]),
   fork: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
   send: new Set(["cwd", "model", "approval", "effort", "mode", "prompt", "prompt-file", "stdin"]),
@@ -558,6 +559,15 @@ async function main() {
     return;
   }
 
+  if (cmd === "session-settings") {
+    const data = await api(state, "POST", "/session-settings", {
+      threadId: flags["thread-id"], conversationId: flags["conversation-id"], sessionKey: flags["session-key"],
+      model: flags.model, effort: flags.effort,
+    });
+    console.log(JSON.stringify(data));
+    return;
+  }
+
   if (cmd === "sync-projects") {
     console.log(JSON.stringify(await api(state, "POST", "/sync-projects", {})));
     return;
@@ -576,6 +586,7 @@ async function main() {
     const r = await api(state, "POST", "/start", {
       ownerConversationId: OWNER_CONV_ID,
       projectId: process.env.ANTIGRAVITY_PROJECT_ID,
+      sessionKey: flags["session-key"],
       cwd: flags.cwd || process.cwd(),
       model: flags.model,
       sandbox: flags.sandbox || "workspace-write",

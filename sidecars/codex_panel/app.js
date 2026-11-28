@@ -203,6 +203,7 @@ function chatRenderer(openThread) {
       );
     }
     if (meta.model) chipItems.push(`<span class="chip" title="模型">${esc(meta.model)}</span>`);
+    if (meta.effort) chipItems.push(`<span class="chip" title="思考强度">${esc(meta.effort)}</span>`);
     if (meta.sandbox) chipItems.push(`<span class="chip" title="沙箱">${esc(meta.sandbox)}</span>`);
     chips.innerHTML = chipItems.join("");
 

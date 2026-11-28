@@ -3,7 +3,20 @@ function startPanel(host) {
   const call = (name, args = {}) => host.call(name, args);
   const chat = chatRenderer(id => openThread(id));
   let lastBinding, lastHostThread, etag = "", selected = false;
-  const controls = panelControls((name, args) => call(name.replace("-", "_"), args));
+  const controls = panelControls((name, args) => call(name.replace("-", "_"), args), async (home, patch) => {
+    const scope = { conversationId: host.conversation?.(), threadId: home.current?.threadId };
+    if (!scope.threadId && !scope.conversationId) {
+      if (!host.handoff) throw new Error("请在具体对话中选择会话设置");
+      scope.sessionKey = host.sessionKey;
+    }
+    const saved = await call("save_session", { ...scope, ...patch });
+    if (scope.sessionKey) await host.handoff();
+    if (page === "standby") {
+      clearTimeout(timer);
+      refresh(++generation);
+    }
+    return saved;
+  });
   let page = "standby", threadId, timer, updateTimer, generation = 0, update, target, busy = false;
   function show(next) {
     page = next;
@@ -11,7 +24,6 @@ function startPanel(host) {
     $("back").hidden = next === "standby";
     $("back").textContent = next === "thread" || !threadId ? "主页" : "返回会话";
     $("general-status").textContent = $("error").textContent = "";
-    $(next === "prefs" ? "prefs-config" : "home-config").append($("selectors"));
     etag = "";
     clearTimeout(timer);
     refresh(++generation);
@@ -32,6 +44,17 @@ function startPanel(host) {
         bridge(home.daemonOnline);
         $("version").textContent = "v" + home.version;
         $("sync").textContent = "项目自动同步 · " + (home.syncReady ? "已开启" : "待启动");
+        controls.syncSession(home);
+        const current = home.current;
+        $("binding-badge").textContent = current ? "已绑定" : "待派单";
+        $("unbound").hidden = Boolean(current);
+        $("current-card").hidden = !current;
+        if (current) {
+          $("current-dot").className = current.status || "";
+          $("current-name").textContent = current.name || current.threadId;
+          $("current-meta").textContent = [current.project, current.model || "模型未记录", current.effort || "强度未记录"].filter(Boolean).join(" · ");
+          $("current-card").onclick = () => openThread(current.threadId);
+        }
         const buttons = home.recent.map(row => {
           const button = document.createElement("button");
           const dot = document.createElement("i");
@@ -64,7 +87,7 @@ function startPanel(host) {
     $("bridge-label").textContent = online ? "桥接就绪" : "待启动";
   }
   function context() {
-    return { conversationId: host.conversation?.(), callId: host.callId?.() };
+    return { conversationId: host.conversation?.(), threadId: lastHostThread, sessionKey: host.sessionKey, callId: host.callId?.() };
   }
   function follow(data) {
     const id = data.binding;

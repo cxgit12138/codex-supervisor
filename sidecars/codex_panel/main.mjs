@@ -45,8 +45,9 @@ function getCodexDbMetaMap(threadIds) {
     const db = new sqliteMod.DatabaseSync(CODEX_STATE_DB, { readOnly: true });
     try {
       const placeholders = threadIds.map(() => "?").join(",");
+      const hasEffort = db.prepare("PRAGMA table_info(threads)").all().some(column => column.name === "reasoning_effort");
       const rows = db
-        .prepare(`SELECT id, cwd, model FROM threads WHERE id IN (${placeholders})`)
+        .prepare(`SELECT id, cwd, model, ${hasEffort ? "reasoning_effort" : "NULL"} AS effort FROM threads WHERE id IN (${placeholders})`)
         .all(...threadIds);
       const nextMap = new Map();
       for (const id of idSet) nextMap.set(id, null);
@@ -54,6 +55,7 @@ function getCodexDbMetaMap(threadIds) {
         nextMap.set(r.id, {
           cwd: cleanWinPath(r.cwd),
           model: r.model || null,
+          effort: r.effort || null,
         });
       }
       dbMetaCache = { ts: now, map: nextMap };
@@ -239,7 +241,7 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
   const st = fs.statSync(filePath);
   const titleHint = titleMap.get(threadId) || null;
   const dbFallback = dbMetaMap?.get(threadId) || null;
-  const cacheKey = `${st.mtimeMs}|${st.size}|${titleHint || ""}|${dbFallback?.cwd || ""}|${dbFallback?.model || ""}`;
+  const cacheKey = `${st.mtimeMs}|${st.size}|${titleHint || ""}|${dbFallback?.cwd || ""}|${dbFallback?.model || ""}|${dbFallback?.effort || ""}`;
 
   let base = parsedLogCache.get(threadId);
   if (!base || base.cacheKey !== cacheKey) {
@@ -263,6 +265,7 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
     if (live.name) meta.name = live.name;
     if (live.cwd) meta.cwd = cleanWinPath(live.cwd);
     if (live.model) meta.model = live.model;
+    if ("effort" in live) meta.effort = live.effort;
     if (live.sandbox) meta.sandbox = live.sandbox;
     inFlightDraft = live.inFlightDraft || "";
     meta.pendingRequestsCount = live.pendingRequestsCount || 0;
@@ -284,6 +287,7 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     name: titleHint || null,
     cwd: dbFallback?.cwd || null,
     model: dbFallback?.model || null,
+    effort: dbFallback?.effort || null,
     sandbox: null,
     approvalPolicy: null,
     status: "idle",
@@ -316,7 +320,15 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     const kind = rec.kind;
     const ts = rec.ts || null;
 
+    if (kind === "session_selection" || kind === "model_rerouted") {
+      if (kind === "session_selection") meta.effort = rec.effort;
+      meta.model = rec.model;
+      lastModelSub = joinSub(meta.model, meta.effort && "effort:" + meta.effort);
+      if (rec.turnId) turnModelSub.set(rec.turnId, lastModelSub);
+      continue;
+    }
     if (kind === "thread_meta") {
+      if ("effort" in rec) meta.effort = rec.effort;
       if (rec.name) meta.name = rec.name;
       if (rec.cwd) meta.cwd = rec.cwd;
       if (rec.model) meta.model = rec.model;
@@ -335,7 +347,9 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         fallback_send: "插队转新轮",
       };
       const extraTags = [];
-      const effModel = rec.model || meta.model || null;
+      if (rec.model) meta.model = rec.model;
+      if ("effort" in rec) meta.effort = rec.effort;
+      const effModel = meta.model;
       if (effModel) extraTags.push(effModel);
       if (rec.effort) extraTags.push(`effort:${rec.effort}`);
       const subStr = extraTags.join(" · ") || null;
@@ -754,6 +768,7 @@ export async function readPanelState(data) {
         name: live.name || titleMap.get(tid) || `会话 ${tid.slice(0, 8)}`,
         cwd: cleanWinPath(live.cwd),
         model: live.model,
+        effort: live.effort,
         sandbox: live.sandbox,
         status: live.status || "running",
         updatedAt: new Date().toISOString(),
@@ -794,7 +809,7 @@ export async function readPanelState(data) {
     }
 
     const sessionSig = sessions
-      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.size ? s.mtimeMs : 0}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.sandbox || ""}:${s.visibleCount}`)
+      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.size ? s.mtimeMs : 0}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.effort || ""}:${s.sandbox || ""}:${s.visibleCount}`)
       .join(",");
     const draftSig = active?.inFlightDraft || "";
     const etag = createHash("sha256").update(JSON.stringify([

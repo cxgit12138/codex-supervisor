@@ -22,7 +22,10 @@ const actions = panelActions(readPanelState);
 // toolInfo.id 标识发起这个视图的 tools/call。同一服务可同时服务多个对话。
 const opened = new Map();
 const home = actions.home[1];
-actions.home[1] = async args => ({ ...await home(args), openedThread: opened.get(args.callId) });
+actions.home[1] = async args => {
+  const openedThread = opened.get(args.callId);
+  return { ...await home({ ...args, threadId: args.threadId || openedThread }), openedThread };
+};
 actions.home[2].callId = { type: ["string", "integer"] };
 for (const [name, [description, , properties = {}]] of Object.entries(actions)) {
   tools.push({ name, description, inputSchema: { type: "object", properties, additionalProperties: false,

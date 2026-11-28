@@ -171,7 +171,7 @@ test("MCP 握手前接好输入与结果通知，空结果不会清除输入目�
   }
   const document = { documentElement: { dataset: {} } };
   vm.runInNewContext(fs.readFileSync(path.join(root, "mcp/transport.js"), "utf8"), {
-    document, SupervisorSDK: { App }, startPanel: () => ({
+    document, crypto: {randomUUID: () => "view-test"}, SupervisorSDK: { App }, startPanel: () => ({
       hostThread(id) { if (id) selections.push(id); }, start() {},
     }),
   });
@@ -212,7 +212,12 @@ test("MCP 待机页读写共享配置、最近五项，以及按提交忽略更�
     fs.writeFileSync(f, JSON.stringify({ kind: "thread_meta", name: "监管任务" + i, cwd: root }));
     fs.utimesSync(f, new Date(), new Date(Date.now() + (i + 1) * 2000));
   }
+  bindThread(stateDir, "partition", "recent-5");
+  const split = await call("home", { conversationId: "partition" });
+  assert.equal(split.current.threadId, "recent-5");
+  assert.deepEqual(split.recent.map(r => r.threadId), ["recent-4", "recent-3", "recent-2", "recent-1", "recent-0"]);
   const home = await call("home");
+  assert.equal(home.current, undefined);
   assert.deepEqual(home.recent.map(r => r.name), ["监管任务5", "监管任务4", "监管任务3", "监管任务2", "监管任务1"]);
   assert.equal(home.recent[0].project, path.basename(root));
   await handle("tools/call", { name: "open_thread", arguments: { threadId: "alpha" } }, 101);
@@ -267,7 +272,72 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     assert.deepEqual(starts.map(p => [p.projectId, p.model, p.config.model_reasoning_effort]), [
       ["codex-project", "worker", "high"], ["codex-project", "explicit", "low"] ]);
     assert.deepEqual(calls.filter(c => c.method === "turn/start").map(c => c.params.effort), ["high", "low"]);
+    const panel = async (name, args) => {
+      const r = await handle("tools/call", { name, arguments: args });
+      assert.ok(!r.isError, JSON.stringify(r.content));
+      return r.structuredContent;
+    };
+    const globalBefore = readSettings();
+    const preferred = "gpt-6.2-astra";
+    const logCalls = method => fs.readFileSync(trace, "utf8").trim().split("\n").map(JSON.parse).filter(c => c.method === method);
+    const lastTurn = () => logCalls("turn/start").at(-1).params;
+    const scope = { threadId: a.threadId };
+    const save = patch => panel("save_session", { ...scope, ...patch });
+    await save({ model: preferred, effort: "max" });
+    let detail = await panel("home", scope);
+    assert.equal(detail.current.model, "worker");
+    assert.equal(detail.selection.pending, true);
+    cli("send", a.threadId, "--prompt", "next");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], [preferred, "max"]);
+    cli("send", a.threadId, "--model", "gpt-6.2-sol", "--effort", "low", "--prompt", "switch");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["gpt-6.2-sol", "low"]);
+    const actual = cli("status", a.threadId).summary;
+    assert.deepEqual([actual.model, actual.effort], ["gpt-6.2-sol", "low"]);
+    detail = await panel("home", scope);
+    assert.deepEqual([detail.current.model, detail.current.effort], [actual.model, actual.effort]);
+    assert.deepEqual(detail.selection, { model: actual.model, effort: actual.effort });
+    const chat = await panel("read_thread", scope);
+    assert.deepEqual([chat.active.meta.model, chat.active.meta.effort], [actual.model, actual.effort]);
+    assert.deepEqual(readSettings(), globalBefore);
+    await save({ model: "", effort: "" });
+    cli("send", a.threadId, "--prompt", "defaults");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["worker", "high"]);
+    saveSettings({ model: "", effort: "" });
+    cli("send", a.threadId, "--prompt", "local defaults");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["mock-model", "low"]);
+    const conv = "not-dispatched";
+    await panel("save_session", { conversationId: conv, model: preferred, effort: "max" });
+    const runIn = (owner, args) => JSON.parse(execFileSync(process.execPath, [path.join(path.dirname(daemon), "codex-ctl.mjs"), ...args], {
+      env: { ...env, ANTIGRAVITY_CONVERSATION_ID: owner }, encoding: "utf8", timeout: 15000 }));
+    const bound = runIn(conv, ["start", "--prompt", "first"]);
+    assert.deepEqual([lastTurn().model, lastTurn().effort], [preferred, "max"]);
+    assert.equal((await panel("home", { conversationId: conv })).current.threadId, bound.threadId);
+    const key = "anonymous-fixture";
+    await panel("save_session", { sessionKey: key, model: preferred, effort: "high" });
+    const linked = runIn("another-conv", ["start", "--session-key", key, "--prompt", "first"]);
+    assert.equal((await panel("home", { sessionKey: key })).current.threadId, linked.threadId);
+    cli("resume", linked.threadId, "--model", "gpt-6.2-sol", "--effort", "max", "--prompt", "resume");
+    assert.equal(cli("status", linked.threadId).summary.effort, "max");
+    const fork = cli("fork", linked.threadId, "--effort", "high", "--prompt", "fork");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["gpt-6.2-sol", "high"]);
+    assert.equal(cli("status", fork.threadId).summary.effort, "high");
+    cli("send", linked.threadId, "--prompt", "test-settings");
+    const reported = cli("status", linked.threadId).summary;
+    assert.deepEqual([reported.model, reported.effort], ["reported-model", "medium"]);
+    cli("send", linked.threadId, "--prompt", "test-reroute");
+    assert.equal(cli("status", linked.threadId).summary.model, "routed-model");
+    saveSettings(globalBefore);
     const state = JSON.parse(fs.readFileSync(path.join(stateDir, "daemon.json")));
+    const duplicate = await fetch("http://127.0.0.1:" + state.port + "/start", { method: "POST",
+      headers: { Authorization: "Bearer " + state.token }, body: JSON.stringify({ sessionKey: key, prompt: "retry" }) });
+    assert.equal(duplicate.status, 409);
+    assert.equal((await duplicate.json()).threadId, linked.threadId);
+    const rejected = await fetch("http://127.0.0.1:" + state.port + "/send", { method: "POST",
+      headers: { Authorization: "Bearer " + state.token }, body: JSON.stringify({ threadId: linked.threadId, model: "rejected-model", effort: "low", prompt: "reject_turn" }) });
+    assert.equal(rejected.ok, false);
+    const afterFailure = await panel("home", { threadId: linked.threadId });
+    assert.equal(afterFailure.current.model, "routed-model");
+    assert.deepEqual(afterFailure.selection, { model: "gpt-6.2-sol", effort: "max" });
     const post = route => fetch("http://127.0.0.1:" + state.port + route, { method: "POST", headers: { Authorization: "Bearer " + state.token } });
     assert.equal((await post("/update-idle")).status, 409);
     writeJson(path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor/install-" + process.pid + ".lock"), process.pid);
@@ -278,6 +348,9 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     else if (proc.exitCode === null) proc.kill();
     await done;
   }
+  const offline = await readPanelState({ threadId: "th-1" });
+  assert.equal(offline.daemonOnline, false);
+  assert.deepEqual([offline.active.meta.model, offline.active.meta.effort], ["mock-model", "low"]);
 });
 
 test("手动更新通过真实 ZIP 完成安装，外部偏好保留，同一包不重复安装", async () => {

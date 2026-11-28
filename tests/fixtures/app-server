@@ -44,7 +44,7 @@ rl.on("line", (line) => {
   if (process.env.SUPERVISOR_TEST_CALLS) {
     require("node:fs").appendFileSync(process.env.SUPERVISOR_TEST_CALLS, JSON.stringify({ method, params }) + "\n");
   }
-  if (method === "config/read") return send({ id, result: { config: { model: "mock-model" } } });
+  if (method === "config/read") return send({ id, result: { config: { model: "mock-model", model_reasoning_effort: "low" } } });
   if (method === "project/list") return send({ id, result: { data: [] } });
   if (method === "project/create") return send({ id, result: { project: { id: "codex-project", roots: params.roots } } });
   if (method === "initialize") {
@@ -53,7 +53,7 @@ rl.on("line", (line) => {
   if (method === "initialized") return;
 
   if (method === "model/list") {
-    return send({ jsonrpc: "2.0", id, result: { models: [{ id: "mock-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "low" }] }] } });
+    return send({ jsonrpc: "2.0", id, result: { models: ["mock-model", "gpt-6.2-sol", "gpt-6.2-astra"].map((id, i) => ({ id, isDefault: i === 0, defaultReasoningEffort: "low", supportedReasoningEfforts: (i ? ["low", "high", "max"] : ["high", "low"]).map(reasoningEffort => ({ reasoningEffort })) })) } });
   }
 
   if (method === "thread/start") {
@@ -123,7 +123,10 @@ rl.on("line", (line) => {
     const tid = params.threadId;
     const turnId = `turn-${turnSeq++}`;
     const promptText = (params.input || []).map((x) => x.text || "").join("\n");
+    if (promptText === "reject_turn") return send({ id, error: { code: -32602, message: "测试拒绝回合" } });
     send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
+    if (promptText === "test-settings") send({ method: "thread/settings/updated", params: { threadId: tid, threadSettings: { model: "reported-model", effort: "medium" } } });
+    if (promptText === "test-reroute") send({ method: "model/rerouted", params: { threadId: tid, turnId, toModel: "routed-model" } });
     send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: turnId } } });
 
     const complete = (text = "done", delayMs = 20) => {

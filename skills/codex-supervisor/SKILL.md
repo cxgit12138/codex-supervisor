@@ -82,7 +82,7 @@ specifies otherwise):
    - Optional flags on `start`, `resume`, `fork`, and `send`:
      - `--cwd <dir>` (target workspace directory; defaults to the shell's
        current directory on `start` if omitted)
-     - 用户明确指定模型或思考强度时传 `--model`、`--effort`。新派单优先使用显式参数，其次使用插件设置；选择「跟随 Codex 本机配置」时交给 Codex 决定。可选强度以该模型返回的列表为准。续聊需要切换时，在同一线程的下一次 `send` 指定。
+     - 用户明确指定模型或思考强度时传 `--model`、`--effort`。每轮依次使用显式参数、当前会话覆盖、插件全局默认及工作目录对应的 Codex 配置。若当前对话的面板上下文提供 `--session-key`，首次 `start` 时原样传入它，随后使用返回的 `threadId`。可选强度以该模型返回的列表为准。续聊需要切换时，在同一线程的下一次 `send` 指定。
      - `--mode <plan|default>` (optional; omit for normal execution. Pass
        `--mode plan` to enter Codex Plan collaboration mode with built-in
        `request_user_input` and structured `plan` output; pass `--mode default`

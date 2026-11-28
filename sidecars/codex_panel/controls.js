@@ -1,19 +1,68 @@
-function panelControls(api) {
+function panelControls(api, saveSession) {
   const $ = id => document.getElementById(id);
   const millions = n => n === 0 ? "0M" : n < 10000 ? "<0.01M" : (n / 1000000).toFixed(2) + "M";
-  let prefs, catalog;
-  function options(select, values, selected) {
-    select.replaceChildren(new Option("跟随 Codex 本机配置", ""));
+  let prefs, catalog, home, choiceKey, savingSession = false;
+  function options(select, values, selected, follow = "跟随 Codex 本机配置") {
+    select.replaceChildren(new Option(follow, ""));
     for (const [value, label] of values) select.add(new Option(label, value));
     if (selected && !Array.from(select.options).some(o => o.value === selected)) select.add(new Option(selected + "（当前未列出）", selected));
     select.value = selected;
   }
-  function efforts(selected) {
-    const id = $("model-select").value || catalog.configuredModel;
+  function levels(modelId) {
+    const id = modelId || catalog.configuredModel;
     const model = id ? catalog.models.find(m => m.id === id) : catalog.models.find(m => m.isDefault);
-    const levels = model?.supportedReasoningEfforts || [];
-    options($("effort-select"), levels.map(v => [v, v]), selected);
+    return (model?.supportedReasoningEfforts || []).map(value => [value, value]);
   }
+  function efforts(selected) {
+    options($("effort-select"), levels($("model-select").value), selected);
+  }
+  function beam(box) {
+    box.classList.remove("beam");
+    void box.offsetWidth;
+    box.classList.add("beam");
+    clearTimeout(box.beamTimer);
+    box.beamTimer = setTimeout(() => box.classList.remove("beam"), 550);
+  }
+  function drawSession() {
+    if (!catalog || !home || savingSession) return;
+    const { current, selection, defaults } = home;
+    const model = selection.pending || !current ? selection.model || "" : current.model || "";
+    const effort = selection.pending || !current ? selection.effort || "" : current.effort || "";
+    const defaultModel = defaults.model || catalog.configuredModel;
+    const defaultEffort = defaults.effort || catalog.configuredEffort;
+    const effective = model || defaultModel;
+    const key = JSON.stringify([model, effort, defaultModel, defaultEffort, catalog.models]);
+    if (key !== choiceKey) {
+      options($("session-model"), catalog.models.map(m => [m.id, m.displayName]), model,
+        defaultModel ? "跟随默认（" + defaultModel + "）" : "跟随默认设置");
+      options($("session-effort"), levels(effective), effort, defaultEffort ? "跟随默认（" + defaultEffort + "）" : "跟随默认设置");
+      choiceKey = key;
+    }
+    $("session-model").disabled = $("session-effort").disabled = false;
+    $("sync-badge").textContent = selection.pending && (selection.model || selection.effort) ? "已切换同步" :
+      current && !selection.pending ? "同步自 Codex" : "跟随默认";
+  }
+  function syncSession(next) {
+    if (savingSession) return;
+    if (home?.current?.threadId === next.current?.threadId && home?.current?.model && next.current?.model && home.current.model !== next.current.model) {
+      beam($("session-config"));
+    }
+    if (home?.selection.pending && !next.selection.pending && next.current) $("general-status").textContent = "";
+    home = next;
+    drawSession();
+  }
+  async function changeSession(event) {
+    const patch = event.target === $("session-model") ? { model: event.target.value } : { effort: event.target.value };
+    if (patch.model !== undefined && home.selection.effort && !levels(patch.model || home.defaults.model).some(([id]) => id === home.selection.effort)) patch.effort = "";
+    savingSession = true;
+    $("session-model").disabled = $("session-effort").disabled = true;
+    try {
+      home.selection = await saveSession(home, patch);
+      $("general-status").textContent = "已保存，下一轮生效";
+    } catch (err) { $("general-status").textContent = err.message; }
+    finally { savingSession = false; choiceKey = null; drawSession(); }
+  }
+  $("session-model").onchange = $("session-effort").onchange = changeSession;
   function drawPrefs() {
     $("open-desktop").checked = prefs.openDesktop;
     if (!catalog) return;
@@ -31,6 +80,7 @@ function panelControls(api) {
       drawPrefs();
       catalog = await api("models");
       drawPrefs();
+      drawSession();
     } catch (err) { $("general-status").textContent = err.message; }
     finally { lockGeneral(false); }
   }
@@ -49,11 +99,7 @@ function panelControls(api) {
       drawPrefs();
       $("general-status").textContent = "已保存";
       if (changedModel) {
-        const box = $("model-feedback");
-        box.classList.remove("beam");
-        void box.offsetWidth;
-        box.classList.add("beam");
-        setTimeout(() => box.classList.remove("beam"), 600);
+        beam($("model-feedback"));
       }
     } catch (err) { drawPrefs(); $("general-status").textContent = err.message; }
     finally { lockGeneral(false); }
@@ -94,5 +140,5 @@ function panelControls(api) {
     }
     $("heatmap").replaceChildren(days);
   }
-  return { loadGeneral, renderUsage };
+  return { loadGeneral, renderUsage, syncSession };
 }

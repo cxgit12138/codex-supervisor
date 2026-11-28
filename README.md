@@ -15,7 +15,7 @@
 
 ## Fork 版设置与更新
 
-打开 Codex Supervisor 侧栏，点击「设置」。常规设置管理新派单的默认模型、强度和桌面跳转，用量页按本地日期汇总监管日志，更新页从 MaLinYu Fork 检查安装包。设置保存在 `~/.gemini/config/codex-supervisor/settings.json`。GitHub 发布包已包含 MCP 视图 SDK，无需 npm install。按钮安装需要系统 curl 和 Python 3（Windows 使用 python.exe）。
+主页「当前会话」的选择只影响该对话的下一轮；右侧卡片显示最近实际使用的模型与强度。「设置」管理全局默认和桌面跳转，用量页按本地日期汇总监管日志，更新页从 MaLinYu Fork 检查安装包。设置保存在 `~/.gemini/config/codex-supervisor/settings.json`。GitHub 发布包已包含 MCP 视图 SDK，无需 npm install。按钮安装需要系统 curl 和 Python 3（Windows 使用 python.exe）。
 
 主分支构建发布在滚动标签 `latest`，正式标签应与 plugin.json 版本一致，例如 `v1.5.0`。包内 install-info.json 记录提交和版本。安装器保留旧版于同一配置目录下的 backups；更新完成后重启 Antigravity 加载新版 MCP 和 hooks。使用源码目录开发时只检查更新。旧的全局 codex-auto-open 和插件跳转二选一，避免同时拉起桌面。
 
@@ -179,7 +179,7 @@ codex-supervisor/
    - 桥接进程 `bridge-daemon.mjs` 会在空闲 **60 分钟后自动退出**；如果结束后想立刻切回 Codex Desktop App 编辑同一会话，可让 Antigravity 执行 `stop`（或运行 `codex-ctl.mjs stop`）立即释放线程写锁。
 
 6. **权限与模型默认行为**
-   - 新派单未显式指定模型或强度时，优先使用插件设置；选「跟随 Codex 本机配置」时使用 Codex 的默认值；
+   - 模型和强度逐项取值：本轮显式参数、当前会话覆盖、插件全局默认、工作目录对应的 Codex 配置；
    - 权限模式由 Antigravity 根据任务风险自动选择（可信仓库开发 / 需审批 / 只读审查），你也可以在对话中随时明确指定（例如「只读模式审查」「改文件前先让我审批」）。
 
 7. **如何自定义 `codex` 可执行文件路径？**
