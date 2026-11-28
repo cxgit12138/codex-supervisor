@@ -10,20 +10,16 @@ import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
-const fallbackSdk = pathToFileURL(
-  path.join(os.homedir(), ".gemini", "antigravity", "lib", "node_modules", "sidecar_sdk", "index.mjs")
-).href;
-const { SidecarApp, Response } = await import("sidecar_sdk").catch(() => import(fallbackSdk));
+import { boundThread } from "../../lib/preferences.mjs";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STATE_DIR = process.env.CODEX_BRIDGE_STATE_DIR || path.join(os.homedir(), ".gemini", "cache", "codex-supervisor");
 const LOGS_DIR = path.join(STATE_DIR, "logs");
 const STATE_FILE = path.join(STATE_DIR, "daemon.json");
-const CODEX_SESSION_INDEX = path.join(os.homedir(), ".codex", "session_index.jsonl");
-const CODEX_STATE_DB = path.join(os.homedir(), ".codex", "state_5.sqlite");
-const NO_STORE = { "Cache-Control": "no-store" };
+const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+const CODEX_SESSION_INDEX = path.join(codexHome, "session_index.jsonl");
+const CODEX_STATE_DB = path.join(codexHome, "state_5.sqlite");
 
 let sqliteMod = null;
 try {
@@ -66,11 +62,6 @@ function getCodexDbMetaMap(threadIds) {
   } catch {}
   return dbMetaCache.map;
 }
-
-const STATIC = {
-  "/styles.css": ["styles.css", "text/css; charset=utf-8"],
-  "/app.js": ["app.js", "application/javascript; charset=utf-8"],
-};
 
 // ---------- Session Title Index (cached by mtime) ----------
 let indexCache = { mtimeMs: 0, size: 0, titles: new Map() };
@@ -720,33 +711,9 @@ function listLogFiles() {
   return out;
 }
 
-// ---------- Sidecar HTTP Server ----------
-const app = new SidecarApp();
-
-app.page("/", () =>
-  new Response(fs.readFileSync(path.join(__dirname, "index.html"), "utf8"), {
-    contentType: "text/html; charset=utf-8",
-    headers: NO_STORE,
-  })
-);
-
-for (const [route, [file, contentType]] of Object.entries(STATIC)) {
-  app.api(
-    route,
-    () =>
-      new Response(fs.readFileSync(path.join(__dirname, file), "utf8"), {
-        contentType,
-        headers: NO_STORE,
-      }),
-    "GET"
-  );
-}
-
-// Use POST so SidecarApp's X-Sidecar-Token validation is strictly enforced on session data
-app.api(
-  "/api/state",
-  async (data) => {
-    const requestedThread = typeof data.threadId === "string" ? data.threadId.trim() : "";
+export async function readPanelState(data) {
+    const binding = boundThread(STATE_DIR, data.conversationId);
+    const requestedThread = binding && binding !== data.knownBinding ? binding : data.threadId || binding;
     const liveStatus = await fetchLiveDaemonStatus();
     const liveMap = new Map();
     if (liveStatus && Array.isArray(liveStatus.threads)) {
@@ -760,7 +727,10 @@ app.api(
     }
 
     const titleMap = getSessionTitleMap();
-    const logFiles = listLogFiles().slice(0, 40);
+    const allLogs = listLogFiles();
+    const logFiles = allLogs.slice(0, 40);
+    const selected = allLogs.find(log => log.threadId === requestedThread);
+    if (selected && !logFiles.includes(selected)) logFiles.push(selected);
     const dbMetaMap = getCodexDbMetaMap(logFiles.map((f) => f.threadId));
 
     const seen = new Set();
@@ -828,6 +798,7 @@ app.api(
     const draftSig = active?.inFlightDraft || "";
     const etag = [
       Boolean(liveStatus),
+      binding,
       sessionSig,
       activeId || "",
       active?.meta?.status || "",
@@ -841,13 +812,15 @@ app.api(
 
     return {
       etag,
+      binding,
       daemonOnline: Boolean(liveStatus),
       sessions,
       activeThreadId: activeId,
       active,
     };
-  },
-  "POST"
-);
+}
 
-app.run();
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  const { serve } = await import("./server.mjs");
+  await serve(readPanelState);
+}

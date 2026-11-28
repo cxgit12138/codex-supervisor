@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Codex Supervisor</title>
   <script src="/preload.js"></script>
-  <link rel="stylesheet" href="./styles.css?v=1.3.2">
+  <link rel="stylesheet" href="./styles.css">
 </head>
 <body>
   <div class="shell">
@@ -16,6 +16,7 @@
         <select id="session-select" class="session-select" aria-label="切换 Codex 会话">
           <option value="">正在加载会话…</option>
         </select>
+        <button type="button" id="settings-btn" class="settings-toggle" aria-controls="settings-panel" aria-expanded="false">设置</button>
         <button type="button" id="refresh-btn" class="icon-btn" title="立即刷新">
           <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
             <path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7"/>
@@ -33,6 +34,38 @@
         </div>
       </div>
     </header>
+
+    <section id="settings-panel" hidden aria-label="插件设置">
+      <nav id="settings-nav" aria-label="设置分类">
+        <button type="button" data-page="general" aria-pressed="true">常规设置</button>
+        <button type="button" data-page="usage">用量统计</button>
+        <button type="button" data-page="update">更新</button>
+      </nav>
+      <div id="page-general" class="settings-page">
+        <label for="model-select">默认工作模型</label>
+        <div id="model-feedback"><select id="model-select" class="session-select"></select></div>
+        <label for="effort-select">默认思考强度</label>
+        <select id="effort-select" class="session-select"></select>
+        <label class="check-row"><input type="checkbox" id="open-desktop">派单、续发或插队后打开 Codex 桌面会话</label>
+        <p id="general-status" role="status"></p>
+      </div>
+      <div id="page-usage" class="settings-page" hidden>
+        <h2>监管会话用量</h2>
+        <div id="usage-periods"></div>
+        <small id="usage-coverage"></small>
+        <h3>近一年每日 Token</h3>
+        <div id="heatmap" aria-label="每日 Token 热力图"></div>
+        <p id="day-detail" role="status"></p>
+      </div>
+      <div id="page-update" class="settings-page" hidden>
+        <h2>插件更新</h2>
+        <p id="update-version"></p>
+        <button type="button" id="check-update">检查更新</button>
+        <button type="button" id="install-update" disabled>立即更新</button>
+        <p id="update-status" role="status"></p>
+      </div>
+      <p id="settings-error" role="alert"></p>
+    </section>
 
     <!-- Chat stream: Left = Codex, Right = Antigravity Supervisor -->
     <main id="chat-scroll" class="chat-scroll" aria-live="polite">
@@ -59,6 +92,7 @@
     <button type="button" id="scroll-bottom-btn" class="scroll-btn hidden" title="回到最新消息">↓ 最新消息</button>
   </div>
 
-  <script src="./app.js?v=1.3.2"></script>
+  <script src="./app.js"></script>
+  <script src="./settings.js"></script>
 </body>
 </html>

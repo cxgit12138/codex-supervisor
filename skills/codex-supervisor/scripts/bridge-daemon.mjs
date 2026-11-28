@@ -9,6 +9,8 @@
 import http from "node:http";
 import net from "node:net";
 import fs from "node:fs";
+import { readSettings, applyDefaults, openDesktop, bindThread, configRoot, activeInstallers } from "../../../lib/preferences.mjs";
+import { projectSync } from "../../../lib/projects.mjs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
@@ -476,6 +478,7 @@ async function acquireStartupLock() {
   return false;
 }
 
+if (activeInstallers().length) throw new Error("插件正在更新，请稍后派单");
 if (!(await acquireStartupLock())) {
   // Flush stdout cleanly before exiting so parent CLI always reads complete {"alreadyRunning":true}
   await new Promise((resolve) => {
@@ -601,6 +604,8 @@ const authToken = crypto.randomBytes(24).toString("hex");
 const hookToken = crypto.randomBytes(24).toString("hex");
 let lastActivityMs = Date.now();
 let shuttingDown = false;
+let dispatches = 0;
+const syncProjects = projectSync(path.join(configRoot, "projects"), path.join(STATE_DIR, "projects.json"), rpcCall);
 
 let codexProc = null;
 let codexReady = false;
@@ -1067,6 +1072,19 @@ function appendThreadLog(st, record) {
   try {
     fs.appendFileSync(st.logPath, JSON.stringify({ ts: new Date().toISOString(), ...record }) + "\n", "utf8");
   } catch {}
+}
+
+function showDesktopThread(threadId, enabled) {
+  if (!enabled) return;
+  openDesktop(threadId, true);
+  if (process.platform === "win32") {
+    // 旧全局 hook 也按日志修改时间去重，交接期间共用这个标记。
+    const log = fs.statSync(getThreadState(threadId).logPath, { throwIfNoEntry: false });
+    if (log) {
+      try { writeJsonAtomic(path.join(STATE_DIR, "last-opened.json"), { threadId, mtimeMs: log.mtimeMs }); }
+      catch (err) { logDaemon("无法记录桌面跳转：" + err.message); }
+    }
+  }
 }
 
 function levelMatches(eventLevel, filter) {
@@ -1766,6 +1784,7 @@ function handleServerNotification(msg) {
 
   if (method === "thread/tokenUsage/updated" && threadId) {
     const st = getThreadState(threadId);
+    appendThreadLog(st, { kind: "token_usage", turnId: p.turnId, tokenUsage: p.tokenUsage });
     st.lastTokenUsage = p;
     st.turnTokenUsage = p;
     return;
@@ -2818,8 +2837,22 @@ async function handleApi(req, res) {
   }
 
   lastActivityMs = Date.now();
+  const dispatch = ["/start", "/resume", "/fork", "/send", "/steer", "/sync-projects"].includes(url.pathname);
+  if (dispatch && activeInstallers().length) return jsonResponse(res, 409, { error: "插件正在更新" });
+  if (dispatch) dispatches++;
 
   try {
+    if (url.pathname === "/update-idle" && req.method === "POST") {
+      const busy = dispatches || pendingServerRequests.size || [...threads.values()].some(st =>
+        st.activeTurnId || st.status === "running" || st.status === "waiting_input" || st.waiters.size ||
+        hasUnexpiredNotificationOrOverflow(st));
+      if (busy) return jsonResponse(res, 409, { error: "监管任务或未读通知尚未处理，请稍后更新" });
+      return jsonResponse(res, 200, { idle: true });
+    }
+    if (url.pathname === "/sync-projects" && req.method === "POST") {
+      await syncProjects();
+      return jsonResponse(res, 200, { synced: true });
+    }
     if (url.pathname === "/inbox" && req.method === "POST") {
       const body = await readJsonBody(req);
       return jsonResponse(res, 200, handleInboxRead(body));
@@ -2831,14 +2864,23 @@ async function handleApi(req, res) {
     }
     if (url.pathname === "/models" && req.method === "GET") {
       const limit = Number(url.searchParams.get("limit") || 30);
-      const data = await rpcCall("model/list", { limit });
-      const items = (data.data || data.models || []).map((m) => ({
+      const all = url.searchParams.has("settings");
+      const rows = [];
+      let cursor;
+      do {
+        const data = await rpcCall("model/list", { limit, cursor });
+        rows.push(...(data.data || data.models || []));
+        cursor = data.nextCursor;
+      } while (all && cursor);
+      const items = rows.filter(m => !m.hidden).map((m) => ({
         id: m.id || m.model || m.slug,
         displayName: m.displayName || m.id,
         defaultReasoningEffort: m.defaultReasoningEffort || null,
         isDefault: Boolean(m.isDefault),
+        supportedReasoningEfforts: (m.supportedReasoningEfforts || []).map(level => level.reasoningEffort),
       }));
-      return jsonResponse(res, 200, { models: items });
+      const configuredModel = all ? (await rpcCall("config/read", {})).config?.model : undefined;
+      return jsonResponse(res, 200, { models: items, configuredModel });
     }
 
     if (url.pathname === "/threads" && req.method === "GET") {
@@ -2858,7 +2900,8 @@ async function handleApi(req, res) {
     }
 
     if (url.pathname === "/start" && req.method === "POST") {
-      const body = await readJsonBody(req);
+      const settings = readSettings();
+      const body = applyDefaults(await readJsonBody(req), settings);
       const reqMode = validateMode(body.mode);
       const startParams = {
         dynamicTools: [SUPERVISOR_DYNAMIC_TOOL],
@@ -2868,11 +2911,14 @@ async function handleApi(req, res) {
       };
       if (body.cwd) startParams.cwd = body.cwd;
       if (body.model) startParams.model = body.model;
+      if (body.effort) startParams.config = { model_reasoning_effort: body.effort };
       if (body.sandbox) startParams.sandbox = body.sandbox;
       if (body.approvalPolicy) startParams.approvalPolicy = body.approvalPolicy;
       if (body.ephemeral !== undefined) startParams.ephemeral = Boolean(body.ephemeral);
       if (body.baseInstructions) startParams.baseInstructions = body.baseInstructions;
 
+      const projectId = await syncProjects(body.projectId, body.cwd);
+      if (projectId) startParams.projectId = projectId;
       const thRes = await rpcCall("thread/start", startParams);
       const threadId = thRes.thread?.id || thRes.threadId || thRes.id;
 
@@ -2938,6 +2984,11 @@ async function handleApi(req, res) {
           logPath: st.logPath,
         };
       });
+      if (body.prompt) {
+        try { bindThread(STATE_DIR, body.ownerConversationId, threadId); }
+        catch (err) { result.panelWarning = "任务已派发，会话绑定保存失败：" + err.message; }
+        showDesktopThread(threadId, settings.openDesktop);
+      }
       return jsonResponse(res, 200, result);
     }
 
@@ -3200,6 +3251,7 @@ async function handleApi(req, res) {
 
     if (url.pathname === "/send" && req.method === "POST") {
       const body = await readJsonBody(req);
+      const { openDesktop: shouldOpen } = readSettings();
       if (!body.threadId || !body.prompt) {
         return jsonResponse(res, 400, { error: "threadId and prompt required" });
       }
@@ -3238,11 +3290,13 @@ async function handleApi(req, res) {
           status: st.status,
         };
       });
+      showDesktopThread(out.threadId, shouldOpen);
       return jsonResponse(res, 200, out);
     }
 
     if (url.pathname === "/steer" && req.method === "POST") {
       const body = await readJsonBody(req);
+      const { openDesktop: shouldOpen } = readSettings();
       if (!body.threadId || !body.prompt) {
         return jsonResponse(res, 400, { error: "threadId and prompt required" });
       }
@@ -3335,6 +3389,7 @@ async function handleApi(req, res) {
           throw err;
         }
       });
+      showDesktopThread(out.threadId, shouldOpen);
       return jsonResponse(res, 200, out);
     }
 
@@ -3551,6 +3606,8 @@ async function handleApi(req, res) {
     if (!res.writableEnded && !res.destroyed) {
       return jsonResponse(res, code, { error: err.message || String(err), ...(err.extra || {}) });
     }
+  } finally {
+    if (dispatch) dispatches--;
   }
 }
 
@@ -3714,7 +3771,9 @@ if (IDLE_TIMEOUT_MS > 0) {
   }, IDLE_SWEEP_MS).unref();
 }
 
+if (activeInstallers().length) cleanupAndExit(1);
 await startCodexProcess();
+syncProjects().catch(err => logDaemon("项目同步失败：" + err.message));
 
 server.listen(0, "127.0.0.1", () => {
   const { port } = server.address();

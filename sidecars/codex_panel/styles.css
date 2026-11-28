@@ -58,6 +58,46 @@
 
 * { box-sizing: border-box; }
 
+[hidden], .settings-open .meta-bar, .settings-open #chat-scroll,
+.settings-open #scroll-bottom-btn { display: none !important; }
+#settings-panel { padding: 12px; overflow: auto; }
+#settings-nav { display: flex; gap: 4px; border-bottom: 1px solid var(--cs-border); }
+.settings-toggle, #settings-panel button {
+  font: inherit; color: var(--cs-fg); background: var(--cs-surface);
+  border: 1px solid var(--cs-border); border-radius: 6px; padding: 5px 9px; cursor: pointer;
+}
+#settings-nav button { border: 0; border-radius: 0; background: transparent; }
+#settings-nav button[aria-pressed="true"] { color: var(--cs-primary); box-shadow: inset 0 -2px var(--cs-primary); }
+.settings-page { padding: 14px 2px; }
+.settings-page label { display: block; margin: 9px 0 4px; }
+.settings-page .session-select { width: 100%; }
+#model-feedback { position: relative; overflow: hidden; border-radius: 7px; }
+#model-feedback.beam::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(105deg, transparent 32%, #74c6ff99, transparent 68%);
+  animation: model-beam 480ms ease-out both;
+}
+@keyframes model-beam { from { transform: translateX(-105%); } to { transform: translateX(105%); } }
+@media (prefers-reduced-motion: reduce) {
+  #model-feedback.beam::after { animation: none; background: transparent; border: 2px solid var(--cs-primary); border-radius: inherit; }
+}
+#usage-periods { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 8px; }
+#usage-periods article { padding: 10px; border: 1px solid var(--cs-border); border-radius: 8px; background: var(--cs-surface); }
+#usage-periods strong, #usage-periods small { display: block; }
+#usage-periods strong { font-size: 16px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.settings-page h2 { margin: 0 0 10px; font-size: 16px; }
+.settings-page h3 { font-size: 13px; }
+.settings-page small, #day-detail { color: var(--cs-fg-muted); }
+#heatmap { display: grid; grid-auto-flow: column; grid-template-rows: repeat(7, 10px); grid-auto-columns: 10px; gap: 2px; overflow-x: auto; padding-bottom: 6px; }
+#heatmap .heat-cell { padding: 0; border: 0; border-radius: 2px; background: var(--cs-muted); }
+#heatmap [data-level="1"] { background: #a6dcb5; }
+#heatmap [data-level="2"] { background: #66b981; }
+#heatmap [data-level="3"] { background: #369961; }
+#heatmap [data-level="4"] { background: #197544; }
+#install-update:enabled { color: white; background: #246738; }
+#settings-panel button:disabled { opacity: .5; cursor: default; }
+#settings-error { color: var(--tone-red); }
+
 html, body {
   margin: 0;
   padding: 0;

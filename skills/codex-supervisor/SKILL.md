@@ -82,8 +82,7 @@ specifies otherwise):
    - Optional flags on `start`, `resume`, `fork`, and `send`:
      - `--cwd <dir>` (target workspace directory; defaults to the shell's
        current directory on `start` if omitted)
-     - `--model <id>` and `--effort <low|medium|high|xhigh>` (omit to use
-       Codex's configured defaults; can also switch model/effort on any `send`)
+     - 用户明确指定模型或思考强度时传 `--model`、`--effort`。新派单优先使用显式参数，其次使用插件设置；选择「跟随 Codex 本机配置」时交给 Codex 决定。可选强度以该模型返回的列表为准。续聊需要切换时，在同一线程的下一次 `send` 指定。
      - `--mode <plan|default>` (optional; omit for normal execution. Pass
        `--mode plan` to enter Codex Plan collaboration mode with built-in
        `request_user_input` and structured `plan` output; pass `--mode default`
@@ -97,6 +96,7 @@ specifies otherwise):
      <clear task brief + acceptance criteria>
      '@ | node $CTL start --cwd "<repo>" --sandbox danger-full-access --approval never --name "<short title>" --stdin
      ```
+   - 首次带任务的 `start` 成功后，立即调用本插件 `panel` MCP 服务的 `open_thread` 工具，传入刚返回的 `threadId`。Antigravity App 会按宿主策略展开侧栏；无需重复派单。CLI 没有图形面板时继续正常监管。
    - Record `threadId` and `cursor` (format `<instanceId>:<seq>`) from the JSON
      output.
 3. **Wait reactively on blocking/terminal events (NEVER poll in a loop)**:

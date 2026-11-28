@@ -41,13 +41,19 @@ rl.on("line", (line) => {
 
   const { id, method, params = {} } = msg;
 
+  if (process.env.SUPERVISOR_TEST_CALLS) {
+    require("node:fs").appendFileSync(process.env.SUPERVISOR_TEST_CALLS, JSON.stringify({ method, params }) + "\n");
+  }
+  if (method === "config/read") return send({ id, result: { config: { model: "mock-model" } } });
+  if (method === "project/list") return send({ id, result: { data: [] } });
+  if (method === "project/create") return send({ id, result: { project: { id: "codex-project", roots: params.roots } } });
   if (method === "initialize") {
     return send({ jsonrpc: "2.0", id, result: { serverInfo: { name: "mock-codex", version: "1.0.0" } } });
   }
   if (method === "initialized") return;
 
   if (method === "model/list") {
-    return send({ jsonrpc: "2.0", id, result: { models: [{ id: "mock-model", isDefault: true }] } });
+    return send({ jsonrpc: "2.0", id, result: { models: [{ id: "mock-model", isDefault: true, supportedReasoningEfforts: [{ reasoningEffort: "high" }, { reasoningEffort: "low" }] }] } });
   }
 
   if (method === "thread/start") {

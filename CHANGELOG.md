@@ -2,6 +2,12 @@
 
 All notable changes to **Codex Supervisor** are documented in this file.
 
+## [1.5.0] — MaLinYu Fork
+
+- 侧栏设置支持选择新派单的默认模型、思考强度和桌面跳转。用量页只统计监管线程。
+- 首次派单保存对话绑定，MCP 查看工具打开对应线程。新增本地项目按目录同步到 Codex。
+- 设置页检查 Fork 的发布包，点击安装时校验文件、备份旧版并在切换失败时恢复。
+
 ## [1.4.0] - 2026-11-26
 
 ### Added

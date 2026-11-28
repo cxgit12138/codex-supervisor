@@ -349,6 +349,8 @@
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          conversationId: window.sidecar?.conversationId,
+          knownBinding: state.data?.binding,
           threadId: reqThreadId || undefined,
           etag: reqEtag || undefined,
         }),
@@ -360,7 +362,7 @@
       if (payload.unchanged) return;
       state.etag = payload.etag || "";
       state.data = payload;
-      if (!state.selectedThreadId && payload.activeThreadId) {
+      if (payload.activeThreadId) {
         state.selectedThreadId = payload.activeThreadId;
       }
       renderSessions(payload.sessions || [], payload.activeThreadId);

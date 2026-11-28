@@ -1,6 +1,6 @@
 # Codex Supervisor for Antigravity
 
-[![Release](https://img.shields.io/github/v/release/cxgit12138/codex-supervisor?color=blue)](https://github.com/cxgit12138/codex-supervisor/releases)
+[![Release](https://img.shields.io/github/v/release/MaLinYu/codex-supervisor?color=blue)](https://github.com/MaLinYu/codex-supervisor/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D22-green.svg)](https://nodejs.org/)
 [![Zero Dependencies](https://img.shields.io/badge/Dependencies-0-brightgreen.svg)](#)
@@ -12,6 +12,12 @@
 ![Codex Supervisor 实时监工与双边对话演示](assets/demo.gif)
 
 ---
+
+## Fork 版设置与更新
+
+打开 Codex Supervisor 侧栏，点击「设置」。常规设置管理新派单的默认模型、强度和桌面跳转，用量页按本地日期汇总监管日志，更新页从 MaLinYu Fork 检查安装包。设置保存在 `~/.gemini/config/codex-supervisor/settings.json`。GitHub 发布包已包含 MCP 视图 SDK，无需 npm install。按钮安装需要系统 curl 和 Python 3（Windows 使用 python.exe）。
+
+主分支构建发布在滚动标签 `latest`，正式标签应与 plugin.json 版本一致，例如 `v1.5.0`。包内 install-info.json 记录提交和版本。安装器保留旧版于同一配置目录下的 backups；更新完成后重启 Antigravity 加载新版 MCP 和 hooks。使用源码目录开发时只检查更新。旧的全局 codex-auto-open 和插件跳转二选一，避免同时拉起桌面。
 
 ## 中文文档
 
@@ -58,7 +64,7 @@
 #### 方式一：使用 Antigravity CLI 一键安装（推荐）
 
 ```bash
-agy plugin install https://github.com/cxgit12138/codex-supervisor
+agy plugin install https://github.com/MaLinYu/codex-supervisor
 ```
 
 #### 方式二：手动克隆到全局插件目录（支持锁定 Release 版本）
@@ -67,17 +73,17 @@ agy plugin install https://github.com/cxgit12138/codex-supervisor
 
 ```powershell
 # 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.0）
-git clone https://github.com/cxgit12138/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
+git clone https://github.com/MaLinYu/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
 ```
 
 **macOS / Linux：**
 
 ```bash
 # 安装最新主分支（如需锁定稳定 Release 版本，追加 --branch v1.4.0）
-git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
+git clone https://github.com/MaLinYu/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
 ```
 
-也可以直接从 [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases) 下载对应版本的源码压缩包，解压到上述 `codex-supervisor` 插件目录中。
+也可以直接从 [GitHub Releases](https://github.com/MaLinYu/codex-supervisor/releases) 下载对应版本的源码压缩包，解压到上述 `codex-supervisor` 插件目录中。
 
 #### 升级插件
 
@@ -173,7 +179,7 @@ codex-supervisor/
    - 桥接进程 `bridge-daemon.mjs` 会在空闲 **60 分钟后自动退出**；如果结束后想立刻切回 Codex Desktop App 编辑同一会话，可让 Antigravity 执行 `stop`（或运行 `codex-ctl.mjs stop`）立即释放线程写锁。
 
 6. **权限与模型默认行为**
-   - 未显式指定 `--model` 或 `--effort` 时，默认继承你本机 `~/.codex/config.toml` 的配置；
+   - 新派单未显式指定模型或强度时，优先使用插件设置；选「跟随 Codex 本机配置」时使用 Codex 的默认值；
    - 权限模式由 Antigravity 根据任务风险自动选择（可信仓库开发 / 需审批 / 只读审查），你也可以在对话中随时明确指定（例如「只读模式审查」「改文件前先让我审批」）。
 
 7. **如何自定义 `codex` 可执行文件路径？**
@@ -202,19 +208,19 @@ codex-supervisor/
 ### Install & Upgrade
 
 ```bash
-agy plugin install https://github.com/cxgit12138/codex-supervisor
+agy plugin install https://github.com/MaLinYu/codex-supervisor
 ```
 
-Or clone manually into Antigravity's global plugins directory (append `--branch v1.4.0` to pin a stable release, or download a source archive from [GitHub Releases](https://github.com/cxgit12138/codex-supervisor/releases)):
+Or clone manually into Antigravity's global plugins directory (append `--branch v1.4.0` to pin a stable release, or download a source archive from [GitHub Releases](https://github.com/MaLinYu/codex-supervisor/releases)):
 
 ```powershell
 # Windows (PowerShell)
-git clone https://github.com/cxgit12138/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
+git clone https://github.com/MaLinYu/codex-supervisor.git "$env:USERPROFILE\.gemini\config\plugins\codex-supervisor"
 ```
 
 ```bash
 # macOS / Linux
-git clone https://github.com/cxgit12138/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
+git clone https://github.com/MaLinYu/codex-supervisor.git "$HOME/.gemini/config/plugins/codex-supervisor"
 ```
 
 To upgrade, run `git pull` (or check out the latest release tag), stop any older running bridge daemon via `codex-ctl.mjs stop` after active tasks finish, and restart **Antigravity** once so `hooks.json` and the Sidecar reload cleanly.

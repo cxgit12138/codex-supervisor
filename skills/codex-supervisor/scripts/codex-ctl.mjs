@@ -22,11 +22,12 @@ const OWNER_CONV_ID =
     ? process.env.ANTIGRAVITY_CONVERSATION_ID.trim()
     : null;
 
-const BOOL_FLAGS = new Set(["ephemeral", "stdin", "fallback-send", "force", "help", "claim", "no-ack"]);
+const BOOL_FLAGS = new Set(["ephemeral", "stdin", "fallback-send", "force", "help", "claim", "no-ack", "settings"]);
 
 const ALLOWED_FLAGS = {
   health: new Set([]),
-  models: new Set(["limit"]),
+  models: new Set(["limit", "settings"]),
+  "sync-projects": new Set([]),
   threads: new Set(["limit", "cwd"]),
   start: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "name", "ephemeral", "prompt", "prompt-file", "stdin"]),
   resume: new Set(["cwd", "model", "sandbox", "approval", "effort", "mode", "claim", "prompt", "prompt-file", "stdin"]),
@@ -552,8 +553,13 @@ async function main() {
   }
 
   if (cmd === "models") {
-    const q = limit ? `?limit=${limit}` : "";
+    const q = flags.settings ? "?settings=1" : limit ? `?limit=${limit}` : "";
     console.log(JSON.stringify(await api(state, "GET", `/models${q}`), null, 2));
+    return;
+  }
+
+  if (cmd === "sync-projects") {
+    console.log(JSON.stringify(await api(state, "POST", "/sync-projects", {})));
     return;
   }
 
@@ -569,6 +575,7 @@ async function main() {
   if (cmd === "start") {
     const r = await api(state, "POST", "/start", {
       ownerConversationId: OWNER_CONV_ID,
+      projectId: process.env.ANTIGRAVITY_PROJECT_ID,
       cwd: flags.cwd || process.cwd(),
       model: flags.model,
       sandbox: flags.sandbox || "workspace-write",

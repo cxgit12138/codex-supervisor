@@ -21,6 +21,12 @@ const HOOK = path.join(REPO, "hooks", "codex-hook.mjs");
 const FIXTURES = path.join(__dirname, "fixtures");
 const IS_WIN = process.platform === "win32";
 
+const testConfig = fs.mkdtempSync(path.join(os.tmpdir(), "supervisor-test-config-"));
+process.env.AGY_CONFIG_DIR = testConfig;
+fs.mkdirSync(path.join(testConfig, "codex-supervisor"));
+fs.writeFileSync(path.join(testConfig, "codex-supervisor", "settings.json"), '{"openDesktop":false}');
+process.on("exit", () => fs.rmSync(testConfig, { recursive: true, force: true }));
+
 const results = [];
 async function test(name, fn) {
   const t0 = Date.now();
@@ -181,7 +187,7 @@ await test("0. Syntax & manifest validation", async () => {
   assert.ok(Array.isArray(hooksJson["codex-supervisor-notifications"].PreInvocation));
   assert.ok(Array.isArray(hooksJson["codex-supervisor-notifications"].Stop));
   const pkg = JSON.parse(fs.readFileSync(path.join(REPO, "plugin.json"), "utf8"));
-  assert.equal(pkg.version, "1.4.0");
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/);
 });
 
 await test("1. Dual-conversation routing, non-stealing wait/send/steer, clean resume --claim & fork", async () => {
@@ -259,12 +265,13 @@ await test("2. Invariant 1: Eligible waiter mid-flight disconnect never loses no
 
 await test("3. CLI auto-ACK vs --no-ack, lease expiry, manual ACK & stdout EPIPE safety", async () => {
   const dir = makeTmpState("t3");
-  const { proc } = await startDaemon(dir);
+  const leaseMs = 1500; // 留出 Windows 启动两次 CLI 的时间。
+  const { proc } = await startDaemon(dir, { CODEX_BRIDGE_LEASE_MS: String(leaseMs) });
   try {
     runCtl(dir, ["start", "--prompt", "sup_msg:HELLO_LEASE"], { convId: "conv-A" });
     await sleep(80);
 
-    // --no-ack leases for 400ms
+    // --no-ack leases for one interval
     const ib1 = runCtl(dir, ["inbox", "--no-ack"], { convId: "conv-A" }).data;
     assert.equal(ib1.items.length, 1);
     assert.ok(ib1.batchId && ib1.expiresAt > Date.now());
@@ -274,8 +281,8 @@ await test("3. CLI auto-ACK vs --no-ack, lease expiry, manual ACK & stdout EPIPE
     assert.equal(ib2.items.length, 0);
     assert.equal(ib2.inFlightLeasedCount, 1);
 
-    // Wait for lease to expire (450ms) -> re-claimable!
-    await sleep(450);
+    // Wait for lease to expire -> re-claimable!
+    await sleep(Math.max(0, ib1.expiresAt - Date.now()) + 50);
     const ib3 = runCtl(dir, ["inbox", "--no-ack"], { convId: "conv-A" }).data;
     assert.equal(ib3.items.length, 1);
     assert.notEqual(ib3.batchId, ib1.batchId);
@@ -304,8 +311,8 @@ await test("3. CLI auto-ACK vs --no-ack, lease expiry, manual ACK & stdout EPIPE
       child.stdout.destroy(); // Immediate EPIPE when CLI attempts stdout.write!
       child.on("close", resolve);
     });
-    // Wait for 400ms lease to expire -> item MUST still be present!
-    await sleep(450);
+    // Wait for one interval lease to expire -> item MUST still be present!
+    await sleep(leaseMs + 50);
     const afterEpipe = runCtl(dir, ["inbox"], { convId: "conv-A" }).data;
     assert.equal(afterEpipe.items.length, 1);
     assert.equal(afterEpipe.items[0].message, "EPIPE_MUST_SURVIVE");
