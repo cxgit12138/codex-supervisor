@@ -128,10 +128,13 @@ test("Fork 检查使用发布清单，自动检查缓存、手动刷新、损坏
   const service = updater(pkg, async url => {
     calls++;
     if (url.includes("/compare/")) return { status: "ahead" };
+    if (url.includes("/commits/")) return { commit: { message: "支持暗色面板\n\n详细说明" } };
     if (url.endsWith("release-manifest.json")) return remote;
     return { tag_name: "latest", assets: [{ name: remote.assetName }, { name: "release-manifest.json" }] };
   });
-  assert.equal((await service.check()).available, true);
+  const update = await service.check();
+  assert.equal(update.available, true);
+  assert.equal(update.remote.summary, "支持暗色面板");
   const first = calls;
   await service.check(); assert.equal(calls, first);
   remote.commitSha = current.commitSha;
@@ -157,6 +160,36 @@ test("MCP stdio 握手、工具和可内联的侧栏资源", () => {
   assert.doesNotMatch(resource.contents[0].text, /<script src=/);
 });
 
+test("MCP 待机页读写共享配置、最近三项，以及按提交忽略更新", async () => {
+  const call = async (name, args = {}) => (await handle("tools/call", { name, arguments: args })).structuredContent;
+  const prefs = await call("settings");
+  await call("save_settings", { model: "ui-model", effort: "low" });
+  assert.equal(readSettings().model, "ui-model");
+  await call("save_settings", prefs);
+  const logs = path.join(stateDir, "logs");
+  for (let i = 0; i < 4; i++) {
+    const f = path.join(logs, "recent-" + i + ".jsonl");
+    fs.writeFileSync(f, JSON.stringify({ kind: "thread_meta", name: "监管任务" + i, cwd: root }));
+    fs.utimesSync(f, new Date(), new Date(Date.now() + (i + 1) * 2000));
+  }
+  const home = await call("home");
+  assert.deepEqual(home.recent.map(r => r.name), ["监管任务3", "监管任务2", "监管任务1"]);
+  assert.equal(home.recent[0].project, path.basename(root));
+  const sha = "d".repeat(40);
+  const cached = { local: { version: home.version }, available: true, remote: { commitSha: sha, summary: "待机页更新" } };
+  const cache = path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor/update-check.json");
+  writeJson(cache, { at: Date.now(), result: cached });
+  assert.equal((await call("check_update")).ignored, false);
+  await call("ignore_update", { commitSha: sha });
+  saveSettings({ openDesktop: false });
+  assert.equal((await call("settings")).ignoredUpdateSha, sha);
+  assert.equal((await call("check_update")).ignored, true);
+  cached.remote.commitSha = "e".repeat(40);
+  writeJson(cache, { at: Date.now(), result: cached });
+  assert.equal((await call("check_update")).ignored, false);
+  await assert.rejects(call("ignore_update", { commitSha: "bad" }), /提交号/);
+});
+
 test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与更新互斥", async () => {
   const fixture = path.join(root, "tests/fixtures");
   const trace = path.join(tmp, "calls");
@@ -175,6 +208,8 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     const models = cli("models", "--settings");
     assert.deepEqual(models.models[0].supportedReasoningEfforts, ["high", "low"]);
     assert.equal(models.configuredModel, "mock-model");
+    const catalog = await handle("tools/call", { name: "models" });
+    assert.deepEqual(catalog.structuredContent, models);
     const a = cli("start", "--cwd", fixture, "--prompt", "stay_running");
     assert.equal(boundThread(stateDir, env.ANTIGRAVITY_CONVERSATION_ID), a.threadId);
     cli("steer", a.threadId, "--prompt", "keep going");

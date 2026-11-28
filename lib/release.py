@@ -21,7 +21,8 @@ REQUIRED = FILES | {INFO, "hooks/codex-hook.mjs", "skills/codex-supervisor/SKILL
                     "sidecars/codex_panel/sidecar.json", "sidecars/codex_panel/main.mjs",
                     "sidecars/codex_panel/server.mjs", "sidecars/codex_panel/app.js", "sidecars/codex_panel/index.html",
                     "sidecars/codex_panel/styles.css", "sidecars/codex_panel/settings.js",
-                    "mcp/server.mjs", "mcp/view.js", "lib/release.py", "lib/preferences.mjs",
+                    "mcp/server.mjs", "mcp/view.js", "mcp/view.html", "mcp/view.css",
+                    "sidecars/codex_panel/controls.js", "lib/release.py", "lib/preferences.mjs",
                     "lib/projects.mjs", "lib/usage.mjs", "lib/update.mjs"}
 VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([\w.-]+))?(?:\+([\w.-]+))?", re.ASCII)
 
@@ -93,19 +94,71 @@ def stage_package(archive_path, manifest, stage):
         raise ValueError("包内插件清单与发布信息不一致")
 
 
+def linked(path):
+    entry = path.lstat()
+    return stat.S_ISLNK(entry.st_mode) or (os.name == "nt" and entry.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT)
+
+
+def replace_file(source, dest):
+    temp = dest.with_name(".update-" + str(uuid4()))
+    try:
+        shutil.copy2(source, temp)
+        os.replace(temp, dest)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def activate_in_place(root, stage, backup):
+    for parent, dirs, files in os.walk(root):
+        if any(linked(Path(parent) / name) for name in dirs + files):
+            raise ValueError("安装目录包含链接，无法原地更新")
+    shutil.copytree(root, backup)
+    changed, created_dirs = [], []
+    try:
+        for src in sorted(stage.rglob("*")):
+            dest = root / src.relative_to(stage)
+            if src.is_dir():
+                if not dest.exists():
+                    dest.mkdir()
+                    created_dirs.append(dest)
+            else:
+                replace_file(src, dest)
+                changed.append(dest)
+        for old in backup.rglob("*"):
+            rel = old.relative_to(backup)
+            if old.is_file() and runtime_file(rel.as_posix()) and not (stage / rel).exists():
+                (root / rel).unlink()
+                changed.append(root / rel)
+    except OSError:
+        for dest in reversed(changed):
+            old = backup / dest.relative_to(root)
+            if old.exists():
+                replace_file(old, dest)
+            else:
+                dest.unlink()
+        for dest in reversed(created_dirs):
+            dest.rmdir()
+        raise
+
+
 def activate(root, stage, data_dir):
     root = root.absolute()
     if ".." in root.parts:
         raise ValueError("安装目录无效")
     for directory in (root, *root.parents):
-        entry = directory.lstat()
-        if stat.S_ISLNK(entry.st_mode) or (os.name == "nt" and entry.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT):
+        if linked(directory):
             raise ValueError("安装目录无效")
     if manifest_at(root)["name"] != "codex-supervisor":
         raise ValueError("安装目录无效")
     backup = data_dir / "backups" / str(uuid4())
     backup.parent.mkdir(exist_ok=True)
-    os.rename(root, backup)
+    try:
+        os.rename(root, backup)
+    except PermissionError as exc:
+        if os.name != "nt" or exc.winerror not in (5, 32, 33):
+            raise
+        activate_in_place(root, stage, backup)
+        return backup
     try:
         os.rename(stage, root)
     except OSError:

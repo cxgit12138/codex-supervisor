@@ -13,7 +13,7 @@ const execute = promisify(execFile);
 const directory = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(directory, "../..");
 const ctl = path.join(root, "skills/codex-supervisor/scripts/codex-ctl.mjs");
-async function control(...args) {
+export async function control(...args) {
   const { stdout } = await execute(process.execPath, [ctl, ...args], { windowsHide: true, cwd: os.homedir(), timeout: 45000 });
   return JSON.parse(stdout);
 }
@@ -49,7 +49,7 @@ export async function serve(readPanelState) {
   const app = new sdk.SidecarApp();
   const usage = usageReader(path.join(stateDir, "logs"));
   const update = updater(root);
-  const files = { "index.html": "text/html", "styles.css": "text/css", "app.js": "text/javascript", "settings.js": "text/javascript" };
+  const files = { "index.html": "text/html", "styles.css": "text/css", "app.js": "text/javascript", "settings.js": "text/javascript", "controls.js": "text/javascript" };
   for (const [name, type] of Object.entries(files)) {
     const response = () => new sdk.Response(fs.readFileSync(path.join(directory, name)), {
       contentType: type + "; charset=utf-8", headers: { "Cache-Control": "no-store" } });
