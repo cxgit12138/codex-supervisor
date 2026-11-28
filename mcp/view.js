@@ -1,7 +1,10 @@
 function startPanel(host) {
   const $ = id => document.getElementById(id);
   const call = (name, args = {}) => host.call(name, args);
-  const chat = chatRenderer(id => openThread(id));
+  const chat = chatRenderer(id => openThread(id), () => {
+    etag = "";
+    resumePolling();
+  });
   let lastBinding, lastHostThread, etag = "", selected = false;
   const controls = panelControls((name, args) => call(name.replace("-", "_"), args), async (home, patch) => {
     const scope = { conversationId: host.conversation?.(), threadId: home.current?.threadId };
@@ -103,7 +106,7 @@ function startPanel(host) {
   function openThread(id) {
     selected = true;
     threadId = id;
-    chat({ active: null, sessions: [] });
+    chat({ active: null, activeThreadId: null, sessions: [] });
     show(id ? "thread" : "standby");
   }
   function hostThread(id, fromInput = false) {

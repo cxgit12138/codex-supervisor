@@ -9,6 +9,8 @@ import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
+const manifestRepository = JSON.parse(fs.readFileSync(path.join(root, "plugin.json"))).repository;
+const forkRepository = new URL(manifestRepository).pathname.slice(1);
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "supervisor-features-"));
 process.env.AGY_CONFIG_DIR = path.join(tmp, "config");
 process.env.CODEX_BRIDGE_STATE_DIR = path.join(tmp, "state");
@@ -61,6 +63,24 @@ test("两个对话的绑定独立，磁盘恢复后仍可定位，手动选择�
   assert.ok(data.structuredContent.active.messages.length > 100);
   assert.equal(data.structuredContent.active.messages.at(-1).detail, "命令输出");
   assert.equal((await handle("tools/call", { name: "read_thread", arguments: { threadId: "unknown" } })).isError, true);
+});
+
+test("两遍读取按实际回合标注模型和强度，同轮追加不会改写旧气泡", async () => {
+  const log = path.join(stateDir, "logs", "per-turn.jsonl");
+  const records = [
+    { kind: "thread_meta", model: "first", effort: "high" },
+    { kind: "agentMessage_full", turnId: "a", text: "回答一", phase: "final_answer" },
+    { kind: "supervisor_prompt", turnId: "a", model: "first", effort: "high", committed: true, turnConfigApplied: true },
+    { kind: "supervisor_prompt", turnId: "a", model: "second", effort: "low", committed: true, turnConfigApplied: false },
+    { kind: "model_rerouted", turnId: "a", model: "routed", threadModel: null },
+    { kind: "agentMessage_full", turnId: "b", text: "回答二", phase: "final_answer" },
+    { kind: "supervisor_prompt", turnId: "b", model: "second", effort: "low", committed: true, turnConfigApplied: true },
+    { kind: "supervisor_prompt", turnId: "failed", model: "rejected", effort: "max", committed: false },
+  ];
+  fs.writeFileSync(log, records.map(row => JSON.stringify(row)).join("\n") + "\n");
+  const { active } = await readPanelState({ threadId: "per-turn" });
+  assert.deepEqual([active.meta.model, active.meta.effort], ["second", "low"]);
+  assert.deepEqual(active.messages.filter(m => m.side === "codex").map(m => m.sub), ["routed · effort:high", "second · effort:low"]);
 });
 
 test("监管用量按本地日期计数，重复快照、接管前历史、缓存子项均不重复累加", async () => {
@@ -137,8 +157,10 @@ test("Fork 检查使用发布清单，自动检查缓存、手动刷新、损坏
   const remote = { ...current, commitSha: "b".repeat(40), releaseTag: "latest", builtAt: new Date().toISOString(),
     sha256: "c".repeat(64), assetName: "codex-supervisor.zip" };
   let calls = 0;
+  writeJson(path.join(pkg, "plugin.json"), { version: current.version, repository: { url: "https://github.com/owner/fork.git" } });
   const service = updater(pkg, async url => {
     calls++;
+    assert.match(url, /^https:\/\/(api\.)?github\.com\/(repos\/)?owner\/fork\//);
     if (url.includes("/compare/")) return { status: "ahead" };
     if (url.includes("/commits/")) return { commit: { message: "支持暗色面板\n\n详细说明" } };
     if (url.endsWith("release-manifest.json")) return remote;
@@ -146,12 +168,19 @@ test("Fork 检查使用发布清单，自动检查缓存、手动刷新、损坏
   });
   const update = await service.check();
   assert.equal(update.available, true);
+  assert.equal(update.remote.url, "https://github.com/owner/fork/releases/download/latest/codex-supervisor.zip");
   assert.equal(update.remote.summary, "支持暗色面板");
   const first = calls;
   await service.check(); assert.equal(calls, first);
   remote.commitSha = current.commitSha;
   assert.equal((await service.check(true)).available, false);
   remote.sha256 = "invalid"; await assert.rejects(service.check(true), /清单/);
+  writeJson(path.join(pkg, "plugin.json"), { version: current.version, repository: "https://example.org/owner/fork" });
+  const fallback = updater(pkg, async url => {
+    assert.match(url, /^https:\/\/api\.github\.com\/repos\/cxgit12138\/codex-supervisor\//);
+    return null;
+  });
+  assert.equal((await fallback.check()).published, false);
   await assert.rejects(service.install("unknown"), /已安装插件/);
 });
 
@@ -230,14 +259,14 @@ test("MCP 待机页读写共享配置、最近五项，以及按提交忽略更�
   const sha = "d".repeat(40);
   const cached = { local: { version: home.version }, available: true, remote: { commitSha: sha, summary: "待机页更新" } };
   const cache = path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor/update-check.json");
-  writeJson(cache, { at: Date.now(), result: cached });
+  writeJson(cache, { repository: forkRepository, at: Date.now(), result: cached });
   assert.equal((await call("check_update")).ignored, false);
   await call("ignore_update", { commitSha: sha });
   saveSettings({ openDesktop: false });
   assert.equal((await call("settings")).ignoredUpdateSha, sha);
   assert.equal((await call("check_update")).ignored, true);
   cached.remote.commitSha = "e".repeat(40);
-  writeJson(cache, { at: Date.now(), result: cached });
+  writeJson(cache, { repository: forkRepository, at: Date.now(), result: cached });
   assert.equal((await call("check_update")).ignored, false);
   assert.equal((await handle("tools/call", { name: "ignore_update", arguments: { commitSha: "bad" } })).isError, true);
 });
@@ -287,6 +316,15 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     let detail = await panel("home", scope);
     assert.equal(detail.current.model, "worker");
     assert.equal(detail.selection.pending, true);
+    const append = cli("send", a.threadId, "--prompt", "append_same_turn");
+    assert.equal(append.turnId, a.turnId);
+    const sameTurn = cli("status", a.threadId).summary;
+    assert.deepEqual([sameTurn.model, sameTurn.effort], [preferred, "max"]);
+    assert.deepEqual([sameTurn.activeTurnModel, sameTurn.activeTurnEffort], ["worker", "high"]);
+    detail = await panel("home", scope);
+    assert.equal(detail.current.model, "worker");
+    assert.equal(detail.selection.pending, true);
+    cli("interrupt", a.threadId);
     cli("send", a.threadId, "--prompt", "next");
     assert.deepEqual([lastTurn().model, lastTurn().effort], [preferred, "max"]);
     cli("send", a.threadId, "--model", "gpt-6.2-sol", "--effort", "low", "--prompt", "switch");
@@ -299,6 +337,9 @@ test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与
     const chat = await panel("read_thread", scope);
     assert.deepEqual([chat.active.meta.model, chat.active.meta.effort], [actual.model, actual.effort]);
     assert.deepEqual(readSettings(), globalBefore);
+    cli("send", a.threadId, "--model", preferred, "--effort", "max", "--prompt", "set effort");
+    cli("send", a.threadId, "--model", "gpt-6.2-sol", "--prompt", "model-only switch");
+    assert.deepEqual([lastTurn().model, lastTurn().effort], ["gpt-6.2-sol", "high"]);
     await save({ model: "", effort: "" });
     cli("send", a.threadId, "--prompt", "defaults");
     assert.deepEqual([lastTurn().model, lastTurn().effort], ["worker", "high"]);

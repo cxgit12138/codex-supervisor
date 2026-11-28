@@ -37,7 +37,7 @@ const ALLOWED_FLAGS = {
   steer: new Set(["turn-id", "fallback-send", "prompt", "prompt-file", "stdin"]),
   interrupt: new Set(["turn-id"]),
   respond: new Set(["decision", "scope", "reason", "permissions", "answer", "answers"]),
-  wait: new Set(["after", "timeout", "events", "force", "no-ack"]),
+  wait: new Set(["after", "timeout", "stall-timeout", "events", "force", "no-ack"]),
   inbox: new Set(["limit", "no-ack"]),
   status: new Set([]),
   history: new Set(["limit"]),
@@ -236,6 +236,23 @@ async function fetchHealth(state) {
   }
 }
 
+async function fetchStrictHealthyDaemon(state) {
+  if (!state || !state.port) {
+    throw new Error("Bridge daemon state is missing port");
+  }
+  if (state.pid !== undefined && !isPidAlive(state.pid)) {
+    throw new Error(`Bridge daemon process (pid=${state.pid}) is not running`);
+  }
+  const res = await httpRequestJson(state.port, "GET", "/health", { timeoutMs: 2500 });
+  if (res.status !== 200 || !res.jsonValid || !res.data || res.data.ok !== true) {
+    throw new Error(`Bridge daemon health check failed (status=${res.status}, ok=${res.data?.ok ?? "invalid"})`);
+  }
+  if (state.instanceId && (typeof res.data.instanceId !== "string" || res.data.instanceId !== state.instanceId)) {
+    throw new Error(`Bridge daemon instance mismatch (expected ${state.instanceId}, got ${res.data.instanceId ?? "missing"})`);
+  }
+  return res.data;
+}
+
 async function checkHealth(state) {
   const h = await fetchHealth(state);
   return Boolean(h && h.ok);
@@ -411,7 +428,7 @@ Commands:
   interrupt <threadId> [--turn-id ID]     Request interruption of active turn
   respond <reqId> --decision accept|acceptForSession|decline|cancel [--scope turn|session]
           [--reason TEXT] [--permissions JSON] | --answer TEXT | --answers JSON
-  wait <threadId> [--after CURSOR] [--timeout SEC] [--events critical|milestone|all] [--force] [--no-ack]
+  wait <threadId> [--after CURSOR] [--timeout SEC] [--stall-timeout SEC] [--events critical|milestone|all] [--force] [--no-ack]
   inbox [threadId] [--limit N] [--no-ack] Read unread Codex notifications & live blocking requests for this conversation
   inbox ack <batchId>                     Explicitly acknowledge a leased inbox/wait batch
   status [threadId]                       Snapshot active thread(s) without blocking
@@ -434,7 +451,8 @@ async function main() {
   let parsedAnswers;
   let parsedPermissions;
   let limit;
-  let timeoutSec;
+  let explicitTimeoutSec;
+  let explicitStallSec;
 
   if (flags.mode !== undefined && flags.mode !== "plan" && flags.mode !== "default") {
     throw new Error(`Invalid --mode "${flags.mode}" (expected "plan" or "default")`);
@@ -447,7 +465,15 @@ async function main() {
   }
   if (cmd === "wait") {
     if (!positional[1]) throw new Error("wait requires <threadId>");
-    timeoutSec = parseIntFlag("timeout", flags.timeout ?? 600, 1, 1800);
+    if (flags.timeout !== undefined) {
+      explicitTimeoutSec = parseIntFlag("timeout", flags.timeout, 1, 1800);
+    }
+    if (flags["stall-timeout"] !== undefined) {
+      explicitStallSec = parseIntFlag("stall-timeout", flags["stall-timeout"], 0, 1800);
+    }
+    if (explicitTimeoutSec !== undefined && explicitStallSec !== undefined && explicitStallSec > explicitTimeoutSec) {
+      throw new Error(`--stall-timeout (${explicitStallSec}) cannot exceed --timeout (${explicitTimeoutSec})`);
+    }
     if (flags.events && !["milestone", "critical", "all"].includes(flags.events)) {
       throw new Error(`Invalid --events value: "${flags.events}" (expected critical|milestone|all)`);
     }
@@ -697,22 +723,36 @@ async function main() {
   }
 
   if (cmd === "wait") {
-    const r = await apiStrict(
-      state,
-      "POST",
-      "/wait",
-      {
-        ownerConversationId: OWNER_CONV_ID,
-        // Always declare batch support on new CLI so `--no-ack` still receives `ackBatchId` for manual `inbox ack`
-        supportsAckBatch: true,
-        threadId: positional[1],
-        after: flags.after ?? 0,
-        timeout: timeoutSec,
-        events: flags.events || "critical",
-        forceWait: Boolean(flags.force),
-      },
-      (timeoutSec + 15) * 1000
-    );
+    const health = await fetchStrictHealthyDaemon(state);
+    const hasStallWatchdog = health.capabilities?.stallWatchdog === true;
+
+    if (!hasStallWatchdog && explicitStallSec !== undefined) {
+      throw new Error(
+        "Running bridge daemon does not support --stall-timeout. Finish active tasks and run `codex-ctl.mjs stop` to upgrade."
+      );
+    }
+
+    const effectiveTimeoutSec = hasStallWatchdog
+      ? (explicitTimeoutSec ?? 1800)
+      : (explicitTimeoutSec ?? 600);
+
+    const reqBody = {
+      ownerConversationId: OWNER_CONV_ID,
+      // Always declare batch support on new CLI so `--no-ack` still receives `ackBatchId` for manual `inbox ack`
+      supportsAckBatch: true,
+      threadId: positional[1],
+      after: flags.after ?? 0,
+      timeout: effectiveTimeoutSec,
+      events: flags.events || "critical",
+      forceWait: Boolean(flags.force),
+    };
+
+    if (hasStallWatchdog) {
+      reqBody.stallTimeout = explicitStallSec !== undefined ? explicitStallSec : Math.min(600, effectiveTimeoutSec);
+      reqBody.timeoutReceiptMode = flags["no-ack"] ? "manual" : "auto";
+    }
+
+    const r = await apiStrict(state, "POST", "/wait", reqBody, (effectiveTimeoutSec + 15) * 1000);
     await writeStdoutComplete(JSON.stringify(r) + "\n");
     if (!flags["no-ack"] && r.ackBatchId) {
       await sendBestEffortAck(state, r.ackBatchId, OWNER_CONV_ID);

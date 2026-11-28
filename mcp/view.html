@@ -19,7 +19,35 @@
 <button id="current-card" hidden><i id="current-dot"></i><span class="current-body"><strong id="current-name"></strong><small id="current-meta"></small></span><span class="enter">进入 ›</span></button>
 <p id="unbound">尚未关联 Codex 会话，左侧发送任务后自动绑定</p></section>
 <section id="history"><h3>最近监管会话</h3><div id="recent"><small>暂无监管会话</small></div></section></div></section>
-<section id="thread" hidden><div class="session-row"><span id="status-dot" class="dot"></span><select id="session-select" class="session-select" aria-label="切换 Codex 会话"></select></div>
+<section id="thread" hidden>
+    <div class="topbar">
+      <div class="session-row">
+        <span id="status-dot" class="dot dot-idle" title="会话状态"></span>
+        <div id="session-picker" class="session-picker">
+          <button
+            type="button"
+            id="session-trigger"
+            class="session-trigger"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+            aria-controls="session-menu"
+            aria-label="切换 Codex 会话"
+          >
+            <span id="session-trigger-title" class="session-trigger-title">正在加载会话…</span>
+            <span id="session-trigger-count" class="session-trigger-count hidden"></span>
+            <svg class="session-trigger-caret" width="13" height="13" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 6l4 4 4-4"/>
+            </svg>
+          </button>
+          <div id="session-menu" class="session-menu hidden" role="listbox" tabindex="-1" aria-label="Codex 会话列表"></div>
+        </div>
+        <button type="button" id="refresh-btn" class="icon-btn" title="立即刷新">
+          <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.4-3.7"/>
+            <path d="M13.5 3v2.8h-2.8"/>
+          </svg>
+        </button>
+      </div>
       <div class="meta-bar">
         <div id="meta-chips" class="meta-chips"></div>
         <div id="detail-mode" class="segmented" role="group" aria-label="内容详略档位">
@@ -28,6 +56,7 @@
           <button type="button" class="seg-btn" data-mode="detailed" title="全部展开（含命令、文件改动及其他工具调用）">详细</button>
         </div>
       </div>
+    </div>
     <div id="chat-scroll" class="chat-scroll" aria-live="polite">
       <div id="empty-state" class="empty-state hidden">
         <div class="empty-title">暂无监管会话记录</div>

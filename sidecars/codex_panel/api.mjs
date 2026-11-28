@@ -54,7 +54,8 @@ export function panelActions(readPanelState) {
       const { daemonOnline, sessions } = await readPanelState({ threadId: id });
       const item = sessions.find(row => row.threadId === id);
       const current = id ? { threadId: id, name: item?.name || id, project: item?.cwd && path.basename(item.cwd),
-        model: item?.model, effort: item?.effort, status: item?.status } : undefined;
+        model: item?.activeTurnModel || item?.model,
+        effort: item?.activeTurnModel ? item.activeTurnEffort : item?.effort, status: item?.status } : undefined;
       const recent = sessions.filter(row => row.threadId !== id).sort((a, b) => b.mtimeMs - a.mtimeMs).slice(0, 5)
         .map(({ threadId, name, cwd, status }) => ({ threadId, name, project: cwd ? path.basename(cwd) : "", status }));
       const selection = id || conversationId || sessionKey ? sessionSettings(stateDir, { threadId: id, conversationId, sessionKey }) : {};

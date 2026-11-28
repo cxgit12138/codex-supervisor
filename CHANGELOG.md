@@ -4,9 +4,51 @@ All notable changes to **Codex Supervisor** are documented in this file.
 
 ## [1.5.0] — MaLinYu Fork
 
+- 合入上游 v1.4.1 的活动看门狗、Codex 0.169.1 协议兼容、逐轮模型与思考强度追踪，以及聊天选择器、长气泡折叠和流式动画。
+- 主页分区、会话设置、用量、项目同步与 MCP 入口继续共用同一套界面。更新来源由插件清单的 repository 指定。
+
 - 侧栏设置支持选择新派单的默认模型、思考强度和桌面跳转。用量页只统计监管线程。
 - 首次派单保存对话绑定，MCP 查看工具打开对应线程。新增本地项目按目录同步到 Codex。
 - 设置页检查 Fork 的发布包，点击安装时校验文件、备份旧版并在切换失败时恢复。
+
+---
+
+## [1.4.1] - 2026-11-27
+
+### Added
+- **Activity-Aware Stall Watchdog (`watchdog-core.mjs`, `bridge-daemon.mjs`, `codex-ctl.mjs`)**:
+  - Replaces blind fixed-interval heartbeat polling with dual-threshold activity-aware stall detection: **10 min (`600s`) silence stall threshold** + **30 min (`1800s`) hard ceiling** by default.
+  - Tracks real Codex progress (`item/started`, `item/completed`, streaming text/reasoning/command/file deltas, `plan/updated` & `patchUpdated` schema-bounded digests, and blocking approvals/questions) using three orthogonal monotonic (`performance.now()`) clocks (`turnRunningSince`, `lastProgress`, `lastDeliveredContact`) that refresh cleanly after every confirmed supervisor wakeup.
+  - Added `--stall-timeout <sec>` (`0..1800`, `0` disables silence detection) to `codex-ctl.mjs wait`, with strict `/health` `capabilities.stallWatchdog === true` negotiation and bidirectional compatibility with older v1.4.0 daemons.
+  - Includes sanitized diagnostic metadata (`timeoutReason: "stall" | "max_wait"`, `silentSec`, `lastActivityKind`, `lastActivityAt`, allowlisted `activeItems`, and sanitized `lastNonRetryableError.code`) in timeout wakeups and `status` summaries.
+- **Unwaited Hook / Inbox Background Watchdog**:
+  - Runs an independent background watchdog (`CODEX_BRIDGE_BG_STALL_SEC=600`, `CODEX_BRIDGE_BG_MAX_RUN_SEC=1800`) for active turns with no attached foreground `wait`, delivering deduplicated `inboxOnly` `turn_watchdog` notifications via existing `PreInvocation` / `Stop` hooks and `codex-ctl.mjs inbox` (without modifying the fixed security-isolated hook templates).
+  - Enforces a single-writer alert slot per turn with `fg_timeout_receipt` lease confirmation (`auto` 5s / `manual` 30s), seamlessly handing off failed foreground `EPIPE` deliveries to the background inbox without duplicate storms.
+- **Portable 11-Group Watchdog Verification Suite (`tests/verify-watchdog.mjs`)**:
+  - Covers unit scheduling/sanitization, active streaming suppression, silent stall detection, `EPIPE` handoff, multi-waiter slot contention, full-queue self-eviction, turn isolation & `0.169.1` cancel payloads, unwaited Hook/Inbox delivery, `--force` rescheduling, and mixed-version compatibility.
+
+### Changed
+- **Sidecar Panel UX Polish: Custom Session Picker, Spring Animations & Seamless Streaming (`sidecars/codex_panel/*`, `bridge-daemon.mjs`)**:
+  - Replaced native OS `<select>` with a custom accessible session dropdown featuring live status dots, dynamic relative timestamps, two-line workspace/model/count metadata, full keyboard navigation, viewport height clamping, and poll-stable menu focus/scroll.
+  - Added O(1) incremental DOM bubble appends (skipping redundant DOM rebuilds when hidden tool writes don't affect visible messages), GPU-composited directional spring pop-in animations, synchronized `easeOutQuart` bottom push-up scrolling (untouched while reading history; immediately cancellable by wheel/touch/pointer/keyboard), smooth reversible `max-height` expand/collapse transitions, and `prefers-reduced-motion` support.
+  - Added exact `itemId` correlation (`inFlightDraftItemIds` / `completedMessageItemIds`) and `activeTurnFinalized` tracking so streaming drafts settle in-place without replaying entrance animations or flashing brief post-`final_answer` ghost "running" bubbles.
+- **Sidecar Panel Collapsible Long Bubbles (`sidecars/codex_panel/app.js`, `styles.css`, `index.html`)**:
+  - Caps tall non-tool chat bubbles at `260px` (with a `56px` hysteresis buffer so short overflows stay natural) using a theme-aware bottom fade mask and a minimalist `显示更多` / `收起` toggle with zero inner scrollbars.
+  - Preserves expanded bubble state and keyboard focus across poll re-renders, anchors scroll cleanly on collapse (keeping the toggle visible in short viewports), links buttons via `aria-controls`, and adapts smoothly to panel width/height resizes.
+- **Codex `0.169.1` App-Server Protocol Hardening**:
+  - Strict `threadId + turnId` scoping prevents late notifications or superseded turns from resurrecting completed turns or poisoning active stall timers.
+  - Enforces single-reply authority on server requests with exact `0.169.1` retirement/cancel payloads (`{ permissions: {}, scope: "turn" }` for permissions, `{ decision: "abort" }` for legacy approvals, `{ decision: "cancel" }` for v2 approvals, `-32602` on malformed requests) and distinguishes non-blocking `item/tool/requestUserInput` (`isBlocking: false`).
+  - Upgraded `POST /wait` validation to strict non-coercing JSON integers and two-phase disconnect cleanup across multi-thread teardown.
+
+### Fixed
+- **Per-Turn Reasoning Effort Tracking & Sidecar Display (`bridge-daemon.mjs`, `sidecars/codex_panel/main.mjs`, `sidecars/codex_panel/app.js`)**:
+  - Tracks thread-level `(model, effort)` separately from active-turn snapshots (`activeTurnModel`, `activeTurnEffort`), reading `reasoningEffort` from `thread/start|resume|fork`, clearing stale effort on cross-model switches, and preventing same-turn appends or rejected `turn/start` responses from relabeling an already-running turn.
+  - Upgraded sidecar log parsing to a two-pass per-turn index with explicit `effortExplicit`/`committed`/`turnConfigApplied` handling, atomic live-bubble scope resolution, and ETag inclusion of `effort` / `lastModelSub` so follow-up turns and legacy logs consistently display their true reasoning effort.
+
+### Upgrade Notes
+- Finish active tasks and run `codex-ctl.mjs stop` so the bridge restarts on the v1.4.1 daemon advertising `capabilities.stallWatchdog: true`.
+
+---
 
 ## [1.4.0] - 2026-11-26
 

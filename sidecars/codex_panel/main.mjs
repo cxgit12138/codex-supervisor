@@ -234,6 +234,18 @@ function formatUserInputRequest(data) {
     .join("\n\n");
 }
 
+function formatModelSub(model, effort) {
+  return [model, effort ? `effort:${effort}` : null].filter(Boolean).join(" · ") || null;
+}
+
+function resolveLiveModelSub(live, fallbackModel, fallbackEffort) {
+  const isRunningLive = live.status === "running" || live.status === "waiting_input";
+  if (isRunningLive && "activeTurnModel" in live && "activeTurnEffort" in live) {
+    return formatModelSub(live.activeTurnModel || null, live.activeTurnEffort || null);
+  }
+  return formatModelSub(fallbackModel, fallbackEffort);
+}
+
 // Per-file parse cache keyed by threadId + file version + fallback meta
 const parsedLogCache = new Map();
 
@@ -260,19 +272,57 @@ function parseThreadLogCached(filePath, threadId, titleMap, liveMap, dbMetaMap) 
   const live = liveMap.get(threadId);
   const meta = { ...base.parsed.meta, isLive: Boolean(live), pendingRequestsCount: 0 };
   let inFlightDraft = "";
+  let inFlightDraftItemIds = [];
   if (live) {
     meta.status = live.status || meta.status;
     if (live.name) meta.name = live.name;
     if (live.cwd) meta.cwd = cleanWinPath(live.cwd);
-    if (live.model) meta.model = live.model;
-    if ("effort" in live) meta.effort = live.effort;
+    const prevMetaModel = meta.model;
+    const liveModel = live.model || meta.model || null;
+    const modelChanged = Boolean(live.model && prevMetaModel && live.model !== prevMetaModel);
+    let liveEffort;
+    if ("effort" in live) {
+      liveEffort = live.effort || null;
+    } else if (modelChanged) {
+      liveEffort = null;
+    } else {
+      liveEffort = meta.effort || null;
+    }
+    meta.model = liveModel;
+    meta.effort = liveEffort;
+    meta.lastModelSub = resolveLiveModelSub(live, liveModel, liveEffort);
+    meta.activeTurnModel = live.activeTurnModel;
+    meta.activeTurnEffort = live.activeTurnEffort;
     if (live.sandbox) meta.sandbox = live.sandbox;
     inFlightDraft = live.inFlightDraft || "";
+    const rawDraftIds = Array.isArray(live.inFlightDraftItemIds)
+      ? live.inFlightDraftItemIds.filter((id) => typeof id === "string" && id.length > 0)
+      : [];
+    inFlightDraftItemIds = rawDraftIds;
     meta.pendingRequestsCount = live.pendingRequestsCount || 0;
+    const activeItemsCount = Number(live.activeItemsTotal || 0);
+    const activeItemsArr = Array.isArray(live.activeItems) ? live.activeItems : [];
+    const hasNonMessageActiveItem =
+      activeItemsCount > activeItemsArr.length ||
+      activeItemsArr.some((it) => it && it.type !== "agentMessage");
+    if (inFlightDraft && rawDraftIds.length > 0) {
+      // Exact itemId check: only clear snapshot-race draft when EVERY draft itemId is already persisted on disk
+      const allCompleted = rawDraftIds.every((id) => base.parsed.completedMessageItemIds?.has(id));
+      if (allCompleted) {
+        inFlightDraft = "";
+        inFlightDraftItemIds = [];
+      }
+    }
+    meta.activeTurnFinalized = Boolean(
+      live.activeTurnId &&
+      !hasNonMessageActiveItem &&
+      base.parsed.finalizedTurns?.has(live.activeTurnId)
+    );
   }
   return {
     meta,
     inFlightDraft,
+    inFlightDraftItemIds,
     lastErrorText: base.parsed.lastErrorText,
     messages: base.parsed.messages,
   };
@@ -282,12 +332,23 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
   const raw = fs.readFileSync(filePath, "utf8");
   const lines = raw.split(/\r?\n/);
 
+  const records = [];
+  for (const line of lines) {
+    if (!line.trim()) continue;
+    try {
+      const rec = JSON.parse(line);
+      if (rec && typeof rec === "object" && !Array.isArray(rec)) records.push(rec);
+    } catch {
+      continue;
+    }
+  }
+
   const meta = {
     threadId,
     name: titleHint || null,
     cwd: dbFallback?.cwd || null,
     model: dbFallback?.model || null,
-    effort: dbFallback?.effort || null,
+    effort: null,
     sandbox: null,
     approvalPolicy: null,
     status: "idle",
@@ -296,46 +357,128 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     size: st.size,
   };
 
+  // Pass 1: build authoritative per-turn (model, effort) map before rendering messages
+  // so out-of-order notifications written before supervisor_prompt never inherit another turn's tag.
+  const turnSelections = new Map();
+  const reroutedModels = new Map();
+  let currentModel = meta.model;
+  let currentEffort = null;
+  let hasExplicitEffortMeta = false;
+  let hasPromptRecords = false;
+  let lastModelSub = formatModelSub(meta.model, null);
+
+  for (const rec of records) {
+    if (rec.kind === "thread_meta") {
+      const prevModel = currentModel;
+      if (rec.name) meta.name = rec.name;
+      if (rec.cwd) meta.cwd = rec.cwd;
+      if (rec.model) {
+        meta.model = rec.model;
+        currentModel = rec.model;
+      }
+      if ("effort" in rec) {
+        hasExplicitEffortMeta = true;
+        meta.effort = rec.effort || null;
+        currentEffort = meta.effort;
+      } else if (rec.model && prevModel && rec.model !== prevModel) {
+        meta.effort = null;
+        currentEffort = null;
+      }
+      if (rec.sandbox) meta.sandbox = rec.sandbox;
+      if (rec.approvalPolicy) meta.approvalPolicy = rec.approvalPolicy;
+      if (currentModel) {
+        lastModelSub = formatModelSub(currentModel, currentEffort);
+      }
+    } else if (rec.kind === "session_selection") {
+      hasExplicitEffortMeta = true;
+      currentModel = meta.model = rec.model;
+      currentEffort = meta.effort = rec.effort || null;
+      lastModelSub = formatModelSub(currentModel, currentEffort);
+    } else if (rec.kind === "model_rerouted") {
+      if (rec.turnId) reroutedModels.set(rec.turnId, rec.model);
+      if (rec.threadModel !== null) {
+        currentModel = meta.model = rec.threadModel || rec.model;
+        lastModelSub = formatModelSub(currentModel, currentEffort);
+      }
+    } else if (rec.kind === "supervisor_prompt") {
+      hasPromptRecords = true;
+      // Rejected/missing-turnId requests are still shown as user messages in Pass 2,
+      // but must NEVER mutate effective thread/turn model or effort state.
+      if (rec.committed === false) continue;
+      const prevModel = currentModel;
+      const effModel = rec.model || currentModel || meta.model || null;
+      const modelChanged = Boolean(rec.model && prevModel && rec.model !== prevModel);
+      let effEffort;
+      if (rec.effort) {
+        effEffort = rec.effort;
+      } else if (rec.effortExplicit === true) {
+        effEffort = null;
+      } else if (hasExplicitEffortMeta && "effort" in rec) {
+        effEffort = null;
+      } else if (modelChanged) {
+        effEffort = null;
+      } else {
+        effEffort = currentEffort;
+      }
+      currentModel = effModel;
+      currentEffort = effEffort || null;
+      if (effModel) meta.model = effModel;
+      meta.effort = currentEffort;
+      const subStr = formatModelSub(effModel, effEffort);
+      if (rec.turnConfigApplied !== false) {
+        if (subStr) lastModelSub = subStr;
+        if (rec.turnId && !turnSelections.has(rec.turnId)) {
+          turnSelections.set(rec.turnId, { model: effModel, effort: effEffort });
+        }
+      }
+    }
+  }
+
+  if (!hasPromptRecords && !hasExplicitEffortMeta && dbFallback && dbFallback.model === meta.model) {
+    meta.effort = dbFallback.effort || null;
+    lastModelSub = formatModelSub(meta.model, meta.effort);
+  }
+  const promptlessFallbackSub = hasPromptRecords ? null : formatModelSub(meta.model, meta.effort);
   const messages = [];
   let seq = 0;
   let lastFinalTextByTurn = new Map();
-  let turnModelSub = new Map();
-  let lastModelSub = dbFallback?.model || null;
+  let completedMessageItemIds = new Set();
+  let finalizedTurns = new Set();
   let lastErrorText = null;
   let sawFileChangeDetail = false;
 
-  const resolveModelSub = (turnId) => (turnId && turnModelSub.get(turnId)) || lastModelSub || meta.model || null;
+  // Never attribute unmapped/unknown turns in prompted logs to the latest turn's model/effort
+  const resolveModelSub = (turnId) => {
+    const selection = turnSelections.get(turnId);
+    const rerouted = reroutedModels.get(turnId);
+    if (selection || rerouted) return formatModelSub(rerouted || selection.model, selection?.effort);
+    return promptlessFallbackSub;
+  };
   const joinSub = (...parts) => parts.filter(Boolean).join(" · ") || null;
 
-  for (const line of lines) {
-    if (!line.trim()) continue;
-    let rec;
-    try {
-      rec = JSON.parse(line);
-    } catch {
-      continue;
-    }
-    if (!rec || typeof rec !== "object" || Array.isArray(rec)) continue;
-
+  // Pass 2: render timeline messages using the pre-built turn index
+  for (const rec of records) {
     const kind = rec.kind;
     const ts = rec.ts || null;
 
-    if (kind === "session_selection" || kind === "model_rerouted") {
-      if (kind === "session_selection") meta.effort = rec.effort;
-      meta.model = rec.model;
-      lastModelSub = joinSub(meta.model, meta.effort && "effort:" + meta.effort);
-      if (rec.turnId) turnModelSub.set(rec.turnId, lastModelSub);
+    if (kind === "session_selection" || kind === "model_rerouted") continue;
+    if (kind === "thread_meta") {
       continue;
     }
-    if (kind === "thread_meta") {
-      if ("effort" in rec) meta.effort = rec.effort;
-      if (rec.name) meta.name = rec.name;
-      if (rec.cwd) meta.cwd = rec.cwd;
-      if (rec.model) meta.model = rec.model;
-      if (rec.sandbox) meta.sandbox = rec.sandbox;
-      if (rec.approvalPolicy) meta.approvalPolicy = rec.approvalPolicy;
-      if (meta.model && !lastModelSub) lastModelSub = meta.model;
-      continue;
+
+    if (
+      rec.turnId &&
+      (kind === "supervisor_prompt" ||
+        kind === "steer_sent" ||
+        kind === "message_supervisor_call" ||
+        kind === "event:approval_request" ||
+        kind === "event:user_input_request" ||
+        kind === "fileChange_detail" ||
+        kind === "event:file_changed" ||
+        kind === "commandExecution" ||
+        kind === "toolExecution")
+    ) {
+      finalizedTurns.delete(rec.turnId);
     }
 
     if (kind === "supervisor_prompt") {
@@ -346,17 +489,6 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         fork: "分叉续聊",
         fallback_send: "插队转新轮",
       };
-      const extraTags = [];
-      if (rec.model) meta.model = rec.model;
-      if ("effort" in rec) meta.effort = rec.effort;
-      const effModel = meta.model;
-      if (effModel) extraTags.push(effModel);
-      if (rec.effort) extraTags.push(`effort:${rec.effort}`);
-      const subStr = extraTags.join(" · ") || null;
-      if (subStr) {
-        lastModelSub = subStr;
-        if (rec.turnId) turnModelSub.set(rec.turnId, subStr);
-      }
       const baseBadge = actionMap[rec.action] || "发送指令";
       messages.push({
         id: ++seq,
@@ -424,8 +556,14 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
       const txt = String(rec.text || "").trim();
       if (!txt) continue;
       if (!isCommentary && rec.turnId) lastFinalTextByTurn.set(rec.turnId, txt);
-      messages.push({
+      if (rec.turnId) {
+        if (rec.phase === "final_answer") finalizedTurns.add(rec.turnId);
+        else finalizedTurns.delete(rec.turnId);
+      }
+      if (rec.itemId && rec.itemId !== "_default") completedMessageItemIds.add(rec.itemId);
+      const msgObj = {
         id: ++seq,
+        itemId: rec.itemId || null,
         side: "codex",
         tier: isCommentary ? "narration" : "core",
         badge: isCommentary ? "过程说明" : "Codex 回复",
@@ -433,7 +571,8 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
         sub: resolveModelSub(rec.turnId),
         ts,
         text: txt,
-      });
+      };
+      messages.push(msgObj);
       continue;
     }
 
@@ -602,7 +741,10 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
     if (kind === "plan_item") {
       const txt = String(rec.text || "").trim();
       if (txt) {
-        if (rec.turnId) lastFinalTextByTurn.set(rec.turnId, txt);
+        if (rec.turnId) {
+          lastFinalTextByTurn.set(rec.turnId, txt);
+          finalizedTurns.delete(rec.turnId);
+        }
         messages.push({
           id: ++seq,
           side: "codex",
@@ -700,12 +842,14 @@ function parseThreadLogDisk(filePath, st, threadId, titleHint, dbFallback) {
   return {
     meta: {
       ...meta,
-      lastModelSub: lastModelSub || meta.model || null,
+      lastModelSub: lastModelSub || formatModelSub(meta.model, meta.effort),
       visibleCount: coreCount,
       processCount: narrationCount + toolCount,
       counts: { core: coreCount, narration: narrationCount, tool: toolCount },
     },
     lastErrorText,
+    finalizedTurns,
+    completedMessageItemIds,
     messages,
   };
 }
@@ -763,12 +907,16 @@ export async function readPanelState(data) {
     }
     for (const [tid, live] of liveMap.entries()) {
       if (seen.has(tid)) continue;
+      const liveEffort = "effort" in live ? (live.effort || null) : null;
       sessions.unshift({
         threadId: tid,
         name: live.name || titleMap.get(tid) || `会话 ${tid.slice(0, 8)}`,
         cwd: cleanWinPath(live.cwd),
         model: live.model,
-        effort: live.effort,
+        effort: liveEffort,
+        lastModelSub: resolveLiveModelSub(live, live.model || null, liveEffort),
+        activeTurnModel: live.activeTurnModel,
+        activeTurnEffort: live.activeTurnEffort,
         sandbox: live.sandbox,
         status: live.status || "running",
         updatedAt: new Date().toISOString(),
@@ -803,13 +951,14 @@ export async function readPanelState(data) {
         active = {
           meta: sMeta,
           inFlightDraft: liveMap.get(activeId)?.inFlightDraft || "",
+          inFlightDraftItemIds: liveMap.get(activeId)?.inFlightDraftItemIds || [],
           messages: [],
         };
       }
     }
 
     const sessionSig = sessions
-      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.size ? s.mtimeMs : 0}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.effort || ""}:${s.sandbox || ""}:${s.visibleCount}`)
+      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.size ? s.mtimeMs : 0}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.effort || ""}:${s.lastModelSub || ""}:${s.sandbox || ""}:${s.visibleCount}`)
       .join(",");
     const draftSig = active?.inFlightDraft || "";
     const etag = createHash("sha256").update(JSON.stringify([
@@ -818,8 +967,11 @@ export async function readPanelState(data) {
       sessionSig,
       activeId || "",
       active?.meta?.status || "",
+      active?.meta?.activeTurnFinalized ? 1 : 0,
+      active?.meta?.lastModelSub || "",
       active?.meta?.pendingRequestsCount || 0,
       draftSig,
+      active?.inFlightDraftItemIds,
     ])).digest("hex");
 
     if (data.etag && data.etag === etag) {

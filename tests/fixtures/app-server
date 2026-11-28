@@ -1,12 +1,22 @@
 // Mock `codex app-server --stdio` for deterministic E2E testing of codex-supervisor.
 // Executed via `node app-server --stdio` when CODEX_BIN=node and cwd contains this file.
+const fs = require("node:fs");
 const readline = require("node:readline");
 
 let threadSeq = 1;
 let turnSeq = 1;
 let serverRpcId = 1000;
 const threadMeta = new Map();
+const lastTurnByThread = new Map();
 const pendingFromClient = new Map();
+const REPLIES_LOG = process.env.MOCK_REPLIES_LOG || "";
+
+function logClientReply(rec) {
+  if (!REPLIES_LOG) return;
+  try {
+    fs.appendFileSync(REPLIES_LOG, JSON.stringify(rec) + "\n", "utf8");
+  } catch {}
+}
 
 function send(obj) {
   process.stdout.write(JSON.stringify(obj) + "\n");
@@ -31,6 +41,7 @@ rl.on("line", (line) => {
 
   // Response from bridge-daemon to our server request
   if (msg.id !== undefined && msg.method === undefined) {
+    logClientReply({ id: msg.id, result: msg.result ?? null, error: msg.error ?? null });
     const cb = pendingFromClient.get(msg.id);
     if (cb) {
       pendingFromClient.delete(msg.id);
@@ -104,7 +115,25 @@ rl.on("line", (line) => {
   }
 
   if (method === "turn/steer") {
-    return send({ jsonrpc: "2.0", id, result: { turnId: params.expectedTurnId } });
+    const steerText = (params.input || []).map((x) => x.text || "").join("\n");
+    send({ jsonrpc: "2.0", id, result: { turnId: params.expectedTurnId } });
+    if (steerText === "__complete_now__") {
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "item/completed",
+          params: { threadId: params.threadId, turnId: params.expectedTurnId, item: { id: `m-${params.expectedTurnId}`, type: "agentMessage", phase: "final_answer", text: "completed_via_steer" } },
+        });
+        send({
+          jsonrpc: "2.0",
+          method: "turn/completed",
+          params: { threadId: params.threadId, turn: { id: params.expectedTurnId, status: "completed" } },
+        });
+      }, 20);
+    } else if (steerText === "__crash_now__") {
+      setTimeout(() => process.exit(2), 20);
+    }
+    return;
   }
 
   if (method === "turn/interrupt") {
@@ -121,9 +150,49 @@ rl.on("line", (line) => {
 
   if (method === "turn/start") {
     const tid = params.threadId;
+    const prevTurnId = lastTurnByThread.get(tid) || null;
     const turnId = `turn-${turnSeq++}`;
     const promptText = (params.input || []).map((x) => x.text || "").join("\n");
     if (promptText === "reject_turn") return send({ id, error: { code: -32602, message: "测试拒绝回合" } });
+    if (promptText === "append_same_turn" && prevTurnId) return send({ id, result: { turn: { id: prevTurnId } } });
+    lastTurnByThread.set(tid, turnId);
+
+    // Special full-terminal queue setup: emit 50 completed turns BEFORE starting the silent turn
+    if (promptText === "emit_50_terminals_then_silent") {
+      for (let i = 1; i <= 50; i++) {
+        const ft = `fake-term-${turnSeq++}`;
+        send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: ft } } });
+        send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: tid, turn: { id: ft, status: "completed" } } });
+      }
+      send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
+      send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: turnId } } });
+      return;
+    }
+
+    // Special startup interleaving scenario: serverRequest arrives BEFORE turn/start RPC result & turn/started
+    if (promptText === "server_req_before_turn_started") {
+      sendServerReq("item/commandExecution/requestApproval", {
+        threadId: tid,
+        turnId,
+        command: "echo interleaved",
+        reason: "startup interleaving",
+      });
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
+        send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: turnId } } });
+      }, 40);
+      return;
+    }
+
+    // Special RPC-first vs notification-first order test: delay turn/started notification
+    if (promptText === "rpc_before_turn_started_notif") {
+      send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: turnId } } });
+      }, 50);
+      return;
+    }
+
     send({ jsonrpc: "2.0", id, result: { turn: { id: turnId } } });
     if (promptText === "test-settings") send({ method: "thread/settings/updated", params: { threadId: tid, threadSettings: { model: "reported-model", effort: "medium" } } });
     if (promptText === "test-reroute") send({ method: "model/rerouted", params: { threadId: tid, turnId, toModel: "routed-model" } });
@@ -141,6 +210,14 @@ rl.on("line", (line) => {
     };
 
     if (promptText.startsWith("stay_running")) {
+      return;
+    }
+
+    if (promptText.startsWith("raw_terminal_after:")) {
+      const ms = Number(promptText.slice("raw_terminal_after:".length) || 1450);
+      setTimeout(() => {
+        send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: tid, turn: { id: turnId, status: "completed" } } });
+      }, ms);
       return;
     }
 
@@ -287,6 +364,267 @@ rl.on("line", (line) => {
 
     if (promptText === "crash_app_server") {
       setTimeout(() => process.exit(2), 30);
+      return;
+    }
+
+    if (promptText.startsWith("crash_after:")) {
+      const ms = Number(promptText.slice("crash_after:".length) || 1400);
+      setTimeout(() => process.exit(2), ms);
+      return;
+    }
+
+    if (promptText.startsWith("stream_active:")) {
+      const [, intStr, cntStr, doneDelayStr] = promptText.split(":");
+      const intervalMs = Number(intStr || 300);
+      const count = Number(cntStr || 6);
+      const doneDelay = Number(doneDelayStr || 100);
+      const itemId = `cmd-stream-${turnId}`;
+      send({
+        jsonrpc: "2.0",
+        method: "item/started",
+        params: { threadId: tid, turnId, item: { id: itemId, type: "commandExecution", command: "npm test --token=SECRET_XYZ" } },
+      });
+      let sent = 0;
+      const iv = setInterval(() => {
+        sent++;
+        send({
+          jsonrpc: "2.0",
+          method: "item/commandExecution/outputDelta",
+          params: { threadId: tid, turnId, itemId, delta: `line ${sent}\n` },
+        });
+        if (sent >= count) {
+          clearInterval(iv);
+          send({
+            jsonrpc: "2.0",
+            method: "item/completed",
+            params: { threadId: tid, turnId, item: { id: itemId, type: "commandExecution", command: "npm test", exitCode: 0 } },
+          });
+          complete("stream finished", doneDelay);
+        }
+      }, intervalMs);
+      return;
+    }
+
+    if (promptText.startsWith("livelock_deltas:")) {
+      const [, intStr, durStr] = promptText.split(":");
+      const intervalMs = Number(intStr || 250);
+      const durMs = Number(durStr || 5000);
+      const itemId = `cmd-live-${turnId}`;
+      send({
+        jsonrpc: "2.0",
+        method: "item/started",
+        params: { threadId: tid, turnId, item: { id: itemId, type: "commandExecution", command: "while true; do echo hi; done" } },
+      });
+      const start = Date.now();
+      const iv = setInterval(() => {
+        if (Date.now() - start >= durMs) {
+          clearInterval(iv);
+          return;
+        }
+        send({
+          jsonrpc: "2.0",
+          method: "item/commandExecution/outputDelta",
+          params: { threadId: tid, turnId, itemId, delta: "spam\n" },
+        });
+      }, intervalMs);
+      return;
+    }
+
+    if (promptText.startsWith("silent_item:")) {
+      const itemType = promptText.slice("silent_item:".length) || "commandExecution";
+      send({
+        jsonrpc: "2.0",
+        method: "item/started",
+        params: {
+          threadId: tid,
+          turnId,
+          item: {
+            id: `silent-${turnId}`,
+            type: itemType,
+            command: "curl -H 'Authorization: Bearer SECRET_TOKEN_12345' https://secret.example.com",
+            server: "secret-mcp-server",
+            tool: "secret_tool_name",
+          },
+        },
+      });
+      return;
+    }
+
+    if (promptText.startsWith("passive_noise:")) {
+      const [, intStr, cntStr] = promptText.split(":");
+      const intervalMs = Number(intStr || 250);
+      const count = Number(cntStr || 10);
+      const itemId = `noise-${turnId}`;
+      // Emit initial plan, diff, patch once at t=0
+      const fixedPlan = { threadId: tid, turnId, explanation: "same", plan: [{ step: "a", status: "inProgress" }] };
+      const fixedDiff = { threadId: tid, turnId, diff: "+++ b/foo.js\n+hello\n" };
+      const fixedPatch = { threadId: tid, turnId, itemId, changes: [{ path: "foo.js", diff: "+x" }] };
+      send({ jsonrpc: "2.0", method: "turn/plan/updated", params: fixedPlan });
+      send({ jsonrpc: "2.0", method: "turn/diff/updated", params: fixedDiff });
+      send({ jsonrpc: "2.0", method: "item/fileChange/patchUpdated", params: fixedPatch });
+      let i = 0;
+      const iv = setInterval(() => {
+        i++;
+        send({ jsonrpc: "2.0", method: "item/commandExecution/terminalInteraction", params: { threadId: tid, turnId, itemId, processId: "1", stdin: "y\n" } });
+        send({ jsonrpc: "2.0", method: "thread/tokenUsage/updated", params: { threadId: tid, turnId, tokenUsage: { total: i } } });
+        send({ jsonrpc: "2.0", method: "item/commandExecution/outputDelta", params: { threadId: tid, turnId, itemId, delta: "" } });
+        send({ jsonrpc: "2.0", method: "turn/plan/updated", params: fixedPlan });
+        send({ jsonrpc: "2.0", method: "turn/diff/updated", params: fixedDiff });
+        send({ jsonrpc: "2.0", method: "item/fileChange/patchUpdated", params: fixedPatch });
+        send({ jsonrpc: "2.0", method: "thread/readState/changed", params: { threadId: tid } });
+        send({ jsonrpc: "2.0", method: "error", params: { threadId: tid, turnId, willRetry: true, error: { message: "transient 503" } } });
+        if (i >= count) clearInterval(iv);
+      }, intervalMs);
+      return;
+    }
+
+    if (promptText === "non_retryable_error") {
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "error",
+          params: {
+            threadId: tid,
+            turnId,
+            willRetry: false,
+            error: { message: "HTTP 429 rate limit exceeded for Bearer TOP_SECRET_KEY_999 at C:\\secret\\path" },
+          },
+        });
+      }, 30);
+      return;
+    }
+
+    if (promptText === "items_21_drop_first_20") {
+      // Out-of-order complete-before-start for i-ooo
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: tid, turnId, item: { id: "i-ooo", type: "commandExecution" } } });
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: tid, turnId, item: { id: "i-ooo", type: "commandExecution" } } });
+      // Start 21 items, duplicate start on i-21, complete i-1..i-20
+      for (let i = 1; i <= 21; i++) {
+        send({ jsonrpc: "2.0", method: "item/started", params: { threadId: tid, turnId, item: { id: `i-${i}`, type: i === 21 ? "mcpToolCall" : "commandExecution" } } });
+      }
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: tid, turnId, item: { id: "i-21", type: "mcpToolCall" } } });
+      for (let i = 1; i <= 20; i++) {
+        send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: tid, turnId, item: { id: `i-${i}`, type: "commandExecution" } } });
+      }
+      // Also start & complete dynamicToolCall message_supervisor to verify early-return cleanup
+      send({ jsonrpc: "2.0", method: "item/started", params: { threadId: tid, turnId, item: { id: "i-sup", type: "dynamicToolCall", tool: "message_supervisor" } } });
+      send({ jsonrpc: "2.0", method: "item/completed", params: { threadId: tid, turnId, item: { id: "i-sup", type: "dynamicToolCall", tool: "message_supervisor" } } });
+      return;
+    }
+
+    if (promptText === "non_blocking_user_input") {
+      setTimeout(() => {
+        sendServerReq("item/tool/requestUserInput", {
+          threadId: tid,
+          turnId,
+          isBlocking: false,
+          questions: [{ id: "q1", question: "optional note?" }],
+        });
+      }, 20);
+      return;
+    }
+
+    if (promptText.startsWith("approval_no_complete:")) {
+      const m = promptText.slice("approval_no_complete:".length);
+      setTimeout(() => {
+        if (m === "permissions") {
+          sendServerReq("item/permissions/requestApproval", {
+            threadId: tid,
+            turnId,
+            permissions: { network: true },
+            reason: "perm test",
+          });
+        } else if (m === "legacy_exec") {
+          sendServerReq("execCommandApproval", {
+            threadId: tid,
+            turnId,
+            command: "echo legacy",
+          });
+        } else if (m === "missing_turnid_v2") {
+          sendServerReq("item/commandExecution/requestApproval", {
+            threadId: tid,
+            command: "echo no-turn",
+          });
+        } else if (m === "server_resolve_no_complete") {
+          const rpcId = sendServerReq("item/commandExecution/requestApproval", {
+            threadId: tid,
+            turnId,
+            command: "echo resolve-me",
+          });
+          setTimeout(() => {
+            send({ jsonrpc: "2.0", method: "serverRequest/resolved", params: { threadId: tid, requestId: rpcId } });
+          }, 120);
+        } else {
+          sendServerReq("item/commandExecution/requestApproval", {
+            threadId: tid,
+            turnId,
+            command: "echo wait-approval",
+          });
+        }
+      }, 20);
+      return;
+    }
+
+    if (promptText === "late_from_prev_turn") {
+      setTimeout(() => {
+        if (prevTurnId) {
+          send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: prevTurnId } } });
+          send({ jsonrpc: "2.0", method: "item/commandExecution/outputDelta", params: { threadId: tid, turnId: prevTurnId, itemId: "old-1", delta: "late delta" } });
+          sendServerReq("item/commandExecution/requestApproval", { threadId: tid, turnId: prevTurnId, command: "echo stale" });
+          send({ jsonrpc: "2.0", method: "turn/completed", params: { threadId: tid, turn: { id: prevTurnId, status: "completed" } } });
+        }
+      }, 40);
+      return;
+    }
+
+    if (promptText.startsWith("plan_then_stay:")) {
+      const label = promptText.slice("plan_then_stay:".length);
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "turn/plan/updated",
+          params: { threadId: tid, turnId, explanation: label, plan: [{ step: label, status: "inProgress" }] },
+        });
+      }, 30);
+      return;
+    }
+
+    if (promptText === "late_revive_after_complete") {
+      complete("turn_b_done", 30);
+      setTimeout(() => {
+        if (prevTurnId) {
+          send({ jsonrpc: "2.0", method: "turn/started", params: { threadId: tid, turn: { id: prevTurnId } } });
+          sendServerReq("item/commandExecution/requestApproval", { threadId: tid, turnId: prevTurnId, command: "echo revive_attempt" });
+          send({
+            jsonrpc: "2.0",
+            method: "turn/completed",
+            params: { threadId: tid, turn: { id: prevTurnId, status: "failed", error: { message: "stale turn A failure" } } },
+          });
+        }
+      }, 120);
+      return;
+    }
+
+    if (promptText === "approval_server_resolve_then_livelock") {
+      setTimeout(() => {
+        const rpcId = sendServerReq("item/commandExecution/requestApproval", {
+          threadId: tid,
+          turnId,
+          command: "echo auto-resolved",
+        });
+        setTimeout(() => {
+          send({ jsonrpc: "2.0", method: "serverRequest/resolved", params: { threadId: tid, requestId: rpcId } });
+          // Emit continuous outputDelta so stall does NOT fire, only BG max_run can fire!
+          const itemId = `post-res-${turnId}`;
+          send({ jsonrpc: "2.0", method: "item/started", params: { threadId: tid, turnId, item: { id: itemId, type: "commandExecution" } } });
+          let n = 0;
+          const iv = setInterval(() => {
+            n++;
+            send({ jsonrpc: "2.0", method: "item/commandExecution/outputDelta", params: { threadId: tid, turnId, itemId, delta: `tick ${n}\n` } });
+            if (n >= 16) clearInterval(iv);
+          }, 250);
+        }, 150);
+      }, 30);
       return;
     }
 

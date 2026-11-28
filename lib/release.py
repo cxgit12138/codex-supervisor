@@ -17,7 +17,7 @@ FILES = {"plugin.json", "hooks.json", "mcp_config.json", "LICENSE", "assets/logo
 FOLDERS = {"hooks", "lib", "sidecars", "skills", "mcp"}
 REQUIRED = FILES | {INFO, "hooks/codex-hook.mjs", "skills/codex-supervisor/SKILL.md",
                     "skills/codex-supervisor/scripts/bridge-daemon.mjs",
-                    "skills/codex-supervisor/scripts/codex-ctl.mjs",
+                    "skills/codex-supervisor/scripts/codex-ctl.mjs", "skills/codex-supervisor/scripts/watchdog-core.mjs",
                     "sidecars/codex_panel/sidecar.json", "sidecars/codex_panel/main.mjs",
                     "sidecars/codex_panel/server.mjs", "sidecars/codex_panel/app.js", "sidecars/codex_panel/index.html",
                     "sidecars/codex_panel/styles.css", "sidecars/codex_panel/settings.js",
