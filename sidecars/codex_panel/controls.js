@@ -1,6 +1,6 @@
 function panelControls(api) {
   const $ = id => document.getElementById(id);
-  const number = new Intl.NumberFormat("zh-CN");
+  const millions = n => n === 0 ? "0M" : n < 10000 ? "<0.01M" : (n / 1000000).toFixed(2) + "M";
   let prefs, catalog;
   function options(select, values, selected) {
     select.replaceChildren(new Option("跟随 Codex 本机配置", ""));
@@ -67,7 +67,7 @@ function panelControls(api) {
       const title = document.createElement("span");
       title.textContent = ["今天", "本周", "本月", "近一年"][index];
       const value = document.createElement("strong");
-      value.textContent = number.format(period.totalTokens);
+      value.textContent = millions(period.totalTokens);
       const cache = document.createElement("small");
       cache.textContent = "缓存命中 " + (period.hitRate == null ? "—" : (100 * period.hitRate).toFixed(1) + "%");
       card.append(title, value, cache);
@@ -84,9 +84,9 @@ function panelControls(api) {
       cell.type = "button";
       cell.className = "heat-cell";
       cell.dataset.level = d?.totalTokens ? Math.min(4, Math.ceil(4 * Math.sqrt(d.totalTokens / peak))) : 0;
-      const detail = key + (d ? " · 共 " + number.format(d.totalTokens) + " · 输入 " + number.format(d.inputTokens) +
-        " · 缓存读取 " + (d.cacheSamples ? number.format(d.cachedInputTokens) : "—") + " · 输出 " + number.format(d.outputTokens) +
-        " · 推理 " + (d.reasoningSamples ? number.format(d.reasoningOutputTokens) : "—") : " · 无用量记录");
+      const detail = key + (d ? " · 共 " + millions(d.totalTokens) + " · 输入 " + millions(d.inputTokens) +
+        " · 缓存读取 " + (d.cacheSamples ? millions(d.cachedInputTokens) : "—") + " · 输出 " + millions(d.outputTokens) +
+        " · 推理 " + (d.reasoningSamples ? millions(d.reasoningOutputTokens) : "—") : " · 无用量记录");
       cell.title = detail;
       cell.setAttribute("aria-label", detail);
       for (const event of ["mouseenter", "focus", "click"]) cell.addEventListener(event, () => { $("day-detail").textContent = detail; });

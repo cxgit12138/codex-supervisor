@@ -2,6 +2,7 @@ import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
+import vm from "node:vm";
 import path from "node:path";
 import { pathToFileURL, fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
@@ -27,6 +28,12 @@ test("共享设置支持跟随、覆盖和显式参数", () => {
   assert.deepEqual(applyDefaults({ model: "explicit" }, readSettings()), { model: "explicit", effort: "high" });
   assert.equal(applyDefaults({ effort: "low" }, readSettings()).effort, "low");
   assert.throws(() => saveSettings({ openDesktop: "no" }), /设置格式/);
+  const peer = path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor", "settings-" + process.ppid + ".lock");
+  fs.writeFileSync(peer, "");
+  try {
+    assert.throws(() => saveSettings({ model: "concurrent" }), /另一个面板/);
+    assert.equal(readSettings().model, "worker");
+  } finally { fs.unlinkSync(peer); }
 });
 
 test("同线程重复跳转合并，切换线程或超过间隔立即打开", () => {
@@ -46,8 +53,13 @@ test("两个对话的绑定独立，磁盘恢复后仍可定位，手动选择�
   assert.equal(boundThread(stateDir, "a"), "alpha");
   assert.equal((await readPanelState({ conversationId: "a", threadId: "beta" })).activeThreadId, "alpha");
   assert.equal((await readPanelState({ conversationId: "a", knownBinding: "alpha", threadId: "beta" })).activeThreadId, "beta");
+  const history = Array.from({ length: 105 }, (_, i) => ({ kind: "agentMessage_full", phase: "final_answer", text: "回复 " + i }));
+  history.push({ kind: "commandExecution", command: "node --version", outputTail: "命令输出" });
+  fs.appendFileSync(path.join(logs, "alpha.jsonl"), history.map(row => JSON.stringify(row)).join("\n") + "\n");
   const data = await handle("tools/call", { name: "read_thread", arguments: { threadId: "alpha" } });
   assert.equal(data.structuredContent.title, "alpha");
+  assert.ok(data.structuredContent.active.messages.length > 100);
+  assert.equal(data.structuredContent.active.messages.at(-1).detail, "命令输出");
   assert.equal((await handle("tools/call", { name: "read_thread", arguments: { threadId: "unknown" } })).isError, true);
 });
 
@@ -143,6 +155,33 @@ test("Fork 检查使用发布清单，自动检查缓存、手动刷新、损坏
   await assert.rejects(service.install("unknown"), /已安装插件/);
 });
 
+test("MCP 握手前接好输入与结果通知，空结果不会清除输入目标", async () => {
+  const selections = [];
+  let sdk;
+  class App {
+    constructor() { sdk = this; }
+    connect() {
+      assert.equal(typeof this.ontoolinput, "function");
+      this.ontoolinput({ arguments: { threadId: "direct" } });
+      this.ontoolinput({ arguments: { Arguments: { threadId: "wrapped" } } });
+      this.ontoolresult({ content: [] });
+      return Promise.resolve();
+    }
+    getHostContext() { return { theme: "dark" }; }
+  }
+  const document = { documentElement: { dataset: {} } };
+  vm.runInNewContext(fs.readFileSync(path.join(root, "mcp/transport.js"), "utf8"), {
+    document, SupervisorSDK: { App }, startPanel: () => ({
+      hostThread(id) { if (id) selections.push(id); }, start() {},
+    }),
+  });
+  await Promise.resolve();
+  sdk.ontoolresult({ structuredContent: { threadId: "result" } });
+  sdk.ontoolresult({ content: [{ type: "text", text: '{"structuredContent":{"threadId":"persisted"}}' }] });
+  assert.deepEqual(selections, ["direct", "wrapped", "result", "persisted"]);
+  assert.equal(document.documentElement.dataset.theme, "dark");
+});
+
 test("MCP stdio 握手、工具和可内联的侧栏资源", () => {
   const requests = [
     { id: 1, method: "initialize", params: { protocolVersion: "2025-06-18" } },
@@ -151,7 +190,8 @@ test("MCP stdio 握手、工具和可内联的侧栏资源", () => {
     { id: 4, method: "resources/read", params: { uri: "ui://codex-supervisor/thread.html" } },
   ];
   const raw = execFileSync(process.execPath, [path.join(root, "mcp/server.mjs")], { input: requests.map(r => JSON.stringify({ jsonrpc: "2.0", ...r })).join("\n") + "\n", encoding: "utf8", maxBuffer: 4e6 });
-  const [init, list, call, resource] = raw.trim().split("\n").map(s => JSON.parse(s).result);
+  const replies = new Map(raw.trim().split("\n").map(line => { const reply = JSON.parse(line); return [reply.id, reply.result]; }));
+  const [init, list, call, resource] = [1, 2, 3, 4].map(id => replies.get(id));
   assert.equal(init.protocolVersion, "2025-06-18");
   assert.deepEqual(list.tools[0]._meta["com.google.antigravity/ui"].entrypoints[0].type, "aux_pane");
   assert.equal(call.structuredContent.threadId, "alpha");
@@ -160,21 +200,28 @@ test("MCP stdio 握手、工具和可内联的侧栏资源", () => {
   assert.doesNotMatch(resource.contents[0].text, /<script src=/);
 });
 
-test("MCP 待机页读写共享配置、最近三项，以及按提交忽略更新", async () => {
+test("MCP 待机页读写共享配置、最近五项，以及按提交忽略更新", async () => {
   const call = async (name, args = {}) => (await handle("tools/call", { name, arguments: args })).structuredContent;
   const prefs = await call("settings");
   await call("save_settings", { model: "ui-model", effort: "low" });
   assert.equal(readSettings().model, "ui-model");
   await call("save_settings", prefs);
   const logs = path.join(stateDir, "logs");
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 6; i++) {
     const f = path.join(logs, "recent-" + i + ".jsonl");
     fs.writeFileSync(f, JSON.stringify({ kind: "thread_meta", name: "监管任务" + i, cwd: root }));
     fs.utimesSync(f, new Date(), new Date(Date.now() + (i + 1) * 2000));
   }
   const home = await call("home");
-  assert.deepEqual(home.recent.map(r => r.name), ["监管任务3", "监管任务2", "监管任务1"]);
+  assert.deepEqual(home.recent.map(r => r.name), ["监管任务5", "监管任务4", "监管任务3", "监管任务2", "监管任务1"]);
   assert.equal(home.recent[0].project, path.basename(root));
+  await handle("tools/call", { name: "open_thread", arguments: { threadId: "alpha" } }, 101);
+  await handle("tools/call", { name: "open_thread", arguments: { threadId: "beta" } }, 102);
+  assert.equal((await call("home", {callId: 101})).openedThread, "alpha");
+  assert.equal((await call("home", {conversationId: "b"})).binding, "beta");
+  assert.equal((await call("home")).binding, null);
+  assert.equal((await call("open_thread", {conversationId: "a"})).threadId, "alpha");
+  assert.equal((await call("read_thread", {threadId: "alpha"})).active.meta.threadId, "alpha");
   const sha = "d".repeat(40);
   const cached = { local: { version: home.version }, available: true, remote: { commitSha: sha, summary: "待机页更新" } };
   const cache = path.join(process.env.AGY_CONFIG_DIR, "codex-supervisor/update-check.json");
@@ -187,7 +234,7 @@ test("MCP 待机页读写共享配置、最近三项，以及按提交忽略更�
   cached.remote.commitSha = "e".repeat(40);
   writeJson(cache, { at: Date.now(), result: cached });
   assert.equal((await call("check_update")).ignored, false);
-  await assert.rejects(call("ignore_update", { commitSha: "bad" }), /提交号/);
+  assert.equal((await handle("tools/call", { name: "ignore_update", arguments: { commitSha: "bad" } })).isError, true);
 });
 
 test("真实 CLI → bridge → 模拟 app-server 的模型、派单、项目与更新互斥", async () => {
@@ -247,7 +294,17 @@ test("手动更新通过真实 ZIP 完成安装，外部偏好保留，同一包
   const service = updater(target, releases, (_, zip) => fs.copyFileSync(path.join(build, manifest.assetName), zip));
   assert.equal((await service.check(true)).available, true);
   await assert.rejects(service.install("old-check"), /重新检查/);
+  const replaced = path.join(target, "install-info.json");
+  const race = updater(target, releases, (_, zip) => {
+    fs.copyFileSync(path.join(build, manifest.assetName), zip);
+    writeJson(replaced, { version: "9.0.0", commitSha: "d".repeat(40) });
+  });
+  await assert.rejects(race.install(commit), /下载期间安装版本已改变/);
+  fs.unlinkSync(replaced);
   const before = readSettings();
+  const deadPid = Number(execFileSync(process.execPath, ["-p", "process.pid"]));
+  writeJson(path.join(stateDir, "daemon.json"), { pid: deadPid, port: 1 });
+  writeJson(path.join(stateDir, "daemon.lock"), { pid: deadPid });
   const result = await service.install(commit);
   assert.equal(JSON.parse(fs.readFileSync(path.join(result.backup, "plugin.json"))).version, "1.4.0");
   assert.equal(JSON.parse(fs.readFileSync(path.join(target, "install-info.json"))).commitSha, commit);

@@ -1,77 +1,21 @@
-/**
- * Codex Supervisor Sidecar Panel Frontend.
- * Polls /api/state with ETag caching, syncs Antigravity theme, renders
- * human-friendly left/right chat bubbles, and switches between Codex sessions.
- */
-(() => {
-  const POLL_MS = 1400;
-  const $ = (id) => document.getElementById(id);
-
-  const VALID_MODES = new Set(["minimal", "default", "detailed"]);
+function chatRenderer(openThread) {
+  const $ = id => document.getElementById(id);
+  const VALID_MODES = new Set(["concise", "default", "detailed"]);
   let initialMode = "default";
   try {
     const saved = localStorage.getItem("codex_panel_detail_mode");
-    if (saved && VALID_MODES.has(saved)) initialMode = saved;
+    if (saved === "minimal") initialMode = "concise";
+    else if (VALID_MODES.has(saved)) initialMode = saved;
   } catch {}
 
   const state = {
-    etag: "",
-    selectedThreadId: "",
-    detailMode: initialMode, // "minimal" | "default" | "detailed"
+    detailMode: initialMode, // "concise" | "default" | "detailed"
     data: null,
-    timer: null,
     stickToBottom: true,
-    reqSeq: 0,
     lastListKey: "",
     renderedThreadId: "",
     openDetails: new Set(),
   };
-
-  function showDiagError(msg) {
-    const text = String(msg || "未知错误");
-    const sel = $("session-select");
-    if (sel && !state.data) {
-      sel.textContent = "";
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = `错误: ${text.slice(0, 60)}`;
-      sel.appendChild(opt);
-    }
-    const empty = $("empty-state");
-    if (empty && !state.data) {
-      empty.classList.remove("hidden");
-      const t = empty.querySelector(".empty-title");
-      const d = empty.querySelector(".empty-desc");
-      if (t) t.textContent = "加载会话失败";
-      if (d) d.textContent = text;
-    }
-  }
-
-  window.addEventListener("error", (e) => showDiagError(`JS Error: ${e.message || e.error}`));
-  window.addEventListener("unhandledrejection", (e) => showDiagError(`Promise Error: ${e.reason?.message || e.reason}`));
-
-  // ---------- Host Theme Sync ----------
-  function syncScheme() {
-    const probe = document.createElement("span");
-    probe.style.cssText = "position:absolute;visibility:hidden;color:var(--background, #f6f7f9)";
-    document.documentElement.appendChild(probe);
-    const c = getComputedStyle(probe).color;
-    probe.remove();
-    const nums = (c.match(/[\d.]+/g) || []).map(Number);
-    if (nums.length < 3) return;
-    const scale = c.startsWith("color(") ? 1 : 255;
-    const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
-    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-    const theme = lum < 0.5 ? "dark" : "light";
-    if (document.documentElement.dataset.theme !== theme) {
-      document.documentElement.dataset.theme = theme;
-    }
-  }
-  syncScheme();
-  new MutationObserver(syncScheme).observe(document.documentElement, {
-    attributes: true,
-    attributeFilter: ["style"],
-  });
 
   // ---------- Safe Markdown Rendering ----------
   const esc = (s) =>
@@ -294,7 +238,7 @@
               ? `<details class="cmd-details" data-msg-id="${esc(m.id)}"${openAttr}><summary>查看输出详情</summary><pre>${esc(m.detail)}</pre></details>`
               : "";
             return `
-              <div class="msg-row side-${m.side}">
+              <div class="msg-row side-${isSup ? "supervisor" : "codex"}">
                 <div class="${cls}">
                   <div class="bubble-head">
                     <span class="role-name">${role}</span>
@@ -336,53 +280,6 @@
     }
   }
 
-  // ---------- Polling ----------
-  async function poll(force = false) {
-    const mySeq = ++state.reqSeq;
-    const reqThreadId = state.selectedThreadId;
-    const reqEtag = force ? "" : state.etag;
-
-    try {
-      const f = window.sidecar?.fetch ? window.sidecar.fetch.bind(window.sidecar) : fetch;
-      const apiUrl = new URL("api/state", window.location.href);
-      const res = await f(apiUrl.pathname, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          conversationId: window.sidecar?.conversationId,
-          knownBinding: state.data?.binding,
-          threadId: reqThreadId || undefined,
-          etag: reqEtag || undefined,
-        }),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status} (${apiUrl.pathname})`);
-      const payload = await res.json();
-      // Discard out-of-order responses after rapid session switching or manual refresh
-      if (mySeq !== state.reqSeq) return;
-      if (payload.unchanged) return;
-      state.etag = payload.etag || "";
-      state.data = payload;
-      if (payload.activeThreadId) {
-        state.selectedThreadId = payload.activeThreadId;
-      }
-      renderSessions(payload.sessions || [], payload.activeThreadId);
-      renderActive(payload);
-    } catch (err) {
-      if (mySeq !== state.reqSeq) return;
-      showDiagError(err?.message || err);
-    }
-  }
-
-  function schedulePoll() {
-    clearTimeout(state.timer);
-    const delay = document.hidden ? 6000 : POLL_MS;
-    state.timer = setTimeout(async () => {
-      await poll(false);
-      schedulePoll();
-    }, delay);
-  }
-
-  // ---------- Events ----------
   function syncModeButtons() {
     for (const btn of $("detail-mode").querySelectorAll(".seg-btn")) {
       const on = btn.dataset.mode === state.detailMode;
@@ -403,18 +300,6 @@
     if (state.data) renderActive(state.data);
   });
 
-  $("session-select").addEventListener("change", (e) => {
-    state.selectedThreadId = e.target.value || "";
-    state.etag = "";
-    state.stickToBottom = true;
-    poll(true);
-  });
-
-  $("refresh-btn").addEventListener("click", () => {
-    state.etag = "";
-    poll(true);
-  });
-
   const scroller = $("chat-scroll");
   const scrollBtn = $("scroll-bottom-btn");
   scroller.addEventListener("scroll", () => {
@@ -428,13 +313,11 @@
     scrollBtn.classList.add("hidden");
   });
 
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) poll(false);
-    schedulePoll();
-  });
-
-  (async () => {
-    await poll(true);
-    schedulePoll();
-  })();
-})();
+  $("session-select").onchange = () => openThread($("session-select").value);
+  return data => {
+    if (state.renderedThreadId !== data.active?.meta.threadId) state.stickToBottom = true;
+    state.data = data;
+    renderSessions(data.sessions, data.active?.meta.threadId);
+    renderActive(data);
+  };
+}

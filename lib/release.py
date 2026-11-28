@@ -21,15 +21,15 @@ REQUIRED = FILES | {INFO, "hooks/codex-hook.mjs", "skills/codex-supervisor/SKILL
                     "sidecars/codex_panel/sidecar.json", "sidecars/codex_panel/main.mjs",
                     "sidecars/codex_panel/server.mjs", "sidecars/codex_panel/app.js", "sidecars/codex_panel/index.html",
                     "sidecars/codex_panel/styles.css", "sidecars/codex_panel/settings.js",
-                    "mcp/server.mjs", "mcp/view.js", "mcp/view.html", "mcp/view.css",
+                    "mcp/vendor/ext-apps.LICENSE", "sidecars/codex_panel/api.mjs", "mcp/transport.js", "mcp/server.mjs", "mcp/view.js", "mcp/view.html", "mcp/view.css",
                     "sidecars/codex_panel/controls.js", "lib/release.py", "lib/preferences.mjs",
                     "lib/projects.mjs", "lib/usage.mjs", "lib/update.mjs"}
 VERSION = re.compile(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-([\w.-]+))?(?:\+([\w.-]+))?", re.ASCII)
 
 
 def complete(archive):
-    return REQUIRED.issubset(archive.namelist()) and any(
-        name.startswith("mcp/vendor/ext-apps-") and name.endswith(".js.gz") for name in archive.namelist())
+    bundles = [name for name in archive.namelist() if re.fullmatch(r"mcp/vendor/ext-apps-[\w.-]+\.js\.gz", name)]
+    return REQUIRED.issubset(archive.namelist()) and len(bundles) == 1
 
 
 def manifest_at(root):

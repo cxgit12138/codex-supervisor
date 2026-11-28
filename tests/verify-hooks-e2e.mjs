@@ -58,7 +58,7 @@ function startDaemon(stateDir, extraEnv = {}) {
         ...process.env,
         CODEX_BIN: process.execPath,
         CODEX_BRIDGE_STATE_DIR: stateDir,
-        CODEX_BRIDGE_LEASE_MS: "400",
+        CODEX_BRIDGE_LEASE_MS: "30000", // 仅过期测试单独缩短租约。
         CODEX_BRIDGE_NUDGE_COOLDOWN_MS: "250",
         CODEX_BRIDGE_FLAG_RETRY_MS: "200",
         ...extraEnv,

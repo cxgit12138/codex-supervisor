@@ -1,7 +1,4 @@
-<!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Codex Supervisor</title><style>/* STYLE */</style></head>
-<body><div id="panel">
+<div id="panel">
 <svg class="symbols" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <symbol id="cube" viewBox="0 0 24 24"><path d="m12 3 8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9"/></symbol>
   <symbol id="terminal" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="3"/><path d="m7 8 4 3-4 3m6 0h4M8 21h8"/></symbol>
@@ -10,22 +7,52 @@
   <symbol id="arrow" viewBox="0 0 24 24"><path d="M4 12h16m-7-7 7 7-7 7"/></symbol>
 </svg>
 <header><b class="brand"><svg><use href="#cube"/></svg>Codex Supervisor</b><span class="bridge"><i id="lamp"></i><span id="bridge-label">待启动</span></span>
-<nav><button id="usage-nav" aria-label="用量统计" title="用量统计"><svg><use href="#chart"/></svg></button><button id="prefs-nav" aria-label="设置" title="设置"><svg><use href="#settings-icon"/></svg></button></nav></header>
+<nav><button id="back" hidden>主页</button><button id="usage-nav" aria-label="用量统计" title="用量统计"><svg><use href="#chart"/></svg></button><button id="prefs-nav" aria-label="设置" title="设置"><svg><use href="#settings-icon"/></svg></button></nav></header>
 <main>
-<button id="back" hidden>返回</button>
+
 <section id="standby">
-<div class="hero"><svg class="terminal"><use href="#terminal"/></svg><h2>当前对话尚未派单</h2>
-<p>在左侧发送开发任务后，这里会自动绑定并展示 Codex 的执行进度与回复。</p>
+<div class="hero"><svg class="terminal"><use href="#terminal"/></svg><h2>监管主页</h2>
+<p>从最近会话继续查看，或在左侧派发新任务。</p>
 <div class="steps"><span>1. 左侧发需求</span><svg><use href="#arrow"/></svg><span>2. 自动建会话</span><svg><use href="#arrow"/></svg><span>3. 实时监工</span></div></div>
 <div id="home-config"><div id="selectors"><label id="model-feedback">默认工作模型<select id="model-select" disabled><option>跟随 Codex</option></select></label>
 <label>默认思考强度<select id="effort-select" disabled><option>跟随 Codex</option></select></label></div></div>
-<h3>最近监管会话</h3><div id="recent"><small>暂无监管会话</small></div></section>
-<section id="thread" hidden><h2 id="title"></h2><p id="status"></p><div id="messages"></div></section>
-<section id="prefs" hidden><h2>常规设置</h2><div id="prefs-config"></div><label><input id="open-desktop" type="checkbox" disabled> 派单后打开 Codex 桌面会话</label></section>
+<section id="history"><h3>最近监管会话</h3><div id="recent"><small>暂无监管会话</small></div></section></section>
+<section id="thread" hidden><div class="session-row"><span id="status-dot" class="dot"></span><select id="session-select" class="session-select" aria-label="切换 Codex 会话"></select></div>
+      <div class="meta-bar">
+        <div id="meta-chips" class="meta-chips"></div>
+        <div id="detail-mode" class="segmented" role="group" aria-label="内容详略档位">
+          <button type="button" class="seg-btn" data-mode="concise" title="仅显示核心双边对话">简洁</button>
+          <button type="button" class="seg-btn on" data-mode="default" title="核心对话 + 过程说明与计划（不含工具调用）">默认</button>
+          <button type="button" class="seg-btn" data-mode="detailed" title="全部展开（含命令、文件改动及其他工具调用）">详细</button>
+        </div>
+      </div>
+    <div id="chat-scroll" class="chat-scroll" aria-live="polite">
+      <div id="empty-state" class="empty-state hidden">
+        <div class="empty-title">暂无监管会话记录</div>
+        <div class="empty-desc">在对话里让我派 Codex 干活后，双方的派单、插队、阶段汇报和验收回复会实时显示在这里。</div>
+      </div>
+
+      <div id="chat-list" class="chat-list"></div>
+
+      <div id="live-indicator" class="live-indicator hidden">
+        <div class="bubble bubble-codex bubble-live">
+          <div class="bubble-head">
+            <span class="role-name">Codex</span>
+            <span class="badge tone-teal">执行中</span>
+            <span id="live-model-sub" class="meta-sub hidden"></span>
+            <span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>
+          </div>
+          <div id="live-draft" class="bubble-body"></div>
+        </div>
+      </div>
+    </div>
+
+    <button type="button" id="scroll-bottom-btn" class="scroll-btn hidden" title="回到最新消息">↓ 最新消息</button>
+</section>
+<section id="prefs" hidden><h2>常规设置</h2><div id="prefs-config"></div><label><input id="open-desktop" type="checkbox" disabled> 派单后打开 Codex 桌面会话</label><p><button id="check-now">检查更新</button></p><small id="check-status" role="status"></small></section>
 <section id="usage" hidden><h2>监管会话用量</h2><div id="usage-periods"></div><small id="usage-coverage"></small><h3>近一年每日 Token</h3><div id="heatmap"></div><p id="day-detail"></p></section>
 <small id="general-status" role="status"></small><small id="error" role="alert"></small>
 </main><footer><span id="sync">项目自动同步 · 待启动</span><button id="update-btn" hidden>更新</button><span id="version"><!-- VERSION --></span></footer>
 </div>
 <dialog id="update-dialog" aria-labelledby="update-title"><h2 id="update-title">插件更新</h2><dl><dt>当前版本</dt><dd id="installed"></dd><dt>最新版本</dt><dd id="latest"></dd><dt>提交摘要</dt><dd id="commit"></dd></dl>
 <p id="install-state" role="status"></p><div class="actions"><button id="ignore">忽略本版本</button><button id="cancel" autofocus>取消</button><button id="install">更新</button></div></dialog>
-<script>/* SCRIPT */</script></body></html>

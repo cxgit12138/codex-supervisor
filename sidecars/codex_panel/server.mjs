@@ -1,22 +1,10 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { configRoot, stateDir, readJson, readSettings, saveSettings } from "../../lib/preferences.mjs";
-import { usageReader } from "../../lib/usage.mjs";
-import { updater } from "../../lib/update.mjs";
+import { pathToFileURL } from "node:url";
+import { configRoot, stateDir, readJson } from "../../lib/preferences.mjs";
 import { pendingProjects } from "../../lib/projects.mjs";
-
-const execute = promisify(execFile);
-const directory = path.dirname(fileURLToPath(import.meta.url));
-const root = path.resolve(directory, "../..");
-const ctl = path.join(root, "skills/codex-supervisor/scripts/codex-ctl.mjs");
-export async function control(...args) {
-  const { stdout } = await execute(process.execPath, [ctl, ...args], { windowsHide: true, cwd: os.homedir(), timeout: 45000 });
-  return JSON.parse(stdout);
-}
+import { control, panelActions, panelFiles, panelHtml } from "./api.mjs";
 
 function watchProjects() {
   const projects = path.join(configRoot, "projects");
@@ -47,26 +35,26 @@ export async function serve(readPanelState) {
     return import(pathToFileURL(fallback).href);
   });
   const app = new sdk.SidecarApp();
-  const usage = usageReader(path.join(stateDir, "logs"));
-  const update = updater(root);
-  const files = { "index.html": "text/html", "styles.css": "text/css", "app.js": "text/javascript", "settings.js": "text/javascript", "controls.js": "text/javascript" };
-  for (const [name, type] of Object.entries(files)) {
-    const response = () => new sdk.Response(fs.readFileSync(path.join(directory, name)), {
-      contentType: type + "; charset=utf-8", headers: { "Cache-Control": "no-store" } });
-    if (name === "index.html") app.page("/", response);
-    else app.api("/" + name, response, "GET");
-  }
-  app.api("/api/state", readPanelState);
-  app.api("/api/settings", () => readSettings());
-  app.api("/api/models", () => control("models", "--settings"));
-  app.api("/api/save-settings", data => saveSettings(data));
-  app.api("/api/usage", () => usage());
-  app.api("/api/update-check", data => update.check(data.manual === true));
-  app.api("/api/update-install", async data => {
-    const result = await update.install(data.commitSha);
+  const actions = panelActions(readPanelState);
+  const install = actions.install_update[1];
+  actions.install_update[1] = async args => {
+    const result = await install(args);
     setTimeout(() => process.exit(0), 1000);
     return result;
-  });
+  };
+  const html = panelHtml();
+  app.page("/", () => new sdk.Response(html, { contentType: "text/html; charset=utf-8", headers: { "Cache-Control": "no-store" } }));
+  for (const [name, file] of Object.entries(panelFiles)) {
+    app.api("/" + name, () => new sdk.Response(fs.readFileSync(file), {
+      contentType: name.endsWith(".js") ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+      headers: { "Cache-Control": "no-store" },
+    }), "GET");
+  }
+  app.api("/api/state", readPanelState);
+  for (const [name, [, run]] of Object.entries(actions)) app.api("/api/" + name, run);
+  for (const [old, name] of Object.entries({ "save-settings": "save_settings", "update-check": "check_update", "update-install": "install_update" })) {
+    app.api("/api/" + old, actions[name][1]);
+  }
   // Windows 会锁住当前工作目录。安装目录必须能在更新时改名。
   process.chdir(os.homedir());
   await app.run();

@@ -7,6 +7,7 @@
  */
 
 import fs from "node:fs";
+import { createHash } from "node:crypto";
 import http from "node:http";
 import os from "node:os";
 import path from "node:path";
@@ -793,10 +794,10 @@ export async function readPanelState(data) {
     }
 
     const sessionSig = sessions
-      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.sandbox || ""}:${s.visibleCount}`)
+      .map((s) => `${s.threadId}:${s.status}:${s.size}:${s.size ? s.mtimeMs : 0}:${s.name}:${s.cwd || ""}:${s.model || ""}:${s.sandbox || ""}:${s.visibleCount}`)
       .join(",");
     const draftSig = active?.inFlightDraft || "";
-    const etag = [
+    const etag = createHash("sha256").update(JSON.stringify([
       Boolean(liveStatus),
       binding,
       sessionSig,
@@ -804,7 +805,7 @@ export async function readPanelState(data) {
       active?.meta?.status || "",
       active?.meta?.pendingRequestsCount || 0,
       draftSig,
-    ].join("|");
+    ])).digest("hex");
 
     if (data.etag && data.etag === etag) {
       return { unchanged: true, etag };
